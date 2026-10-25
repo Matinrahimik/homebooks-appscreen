@@ -1,0 +1,19 @@
+# Future CLI deploys. The API handoff uses worker/deploy/metadata.json
+# and the bundled file worker/dist/worker.js. Replace the KV id before
+# `wrangler deploy`; do not commit a real namespace id.
+name = "homebooks-appscreen-mcp"
+main = "dist/worker.js"
+compatibility_date = "2026-10-25"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[browser]
+binding = "BROWSER"
+
+[[kv_namespaces]]
+binding = "APPSCREEN_KV"
+id = "__KV_NAMESPACE_ID__"
+
+[vars]
+PAGES_ORIGIN = "https://matinrahimik.github.io"
+PAGES_PATH = "/homebooks-appscreen/"

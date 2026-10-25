@@ -703,6 +703,23 @@ function setThreeJSRotation(rotX, rotY, rotZ) {
     requestThreeJSRender();
 }
 
+// Travel in world units for a screenshot scale percent and x/y percents.
+// Below 92% the historical (1 - scale) formula is unchanged. At 92% and above,
+// including scales past 100%, travel stays large enough to move the device off-canvas.
+function deviceFramingOffset(scalePercent, x, y) {
+    const scale = (Number(scalePercent) || 70) / 100;
+    let travelX = (1 - scale) * 0.9;
+    let travelY = (1 - scale) * 2;
+    if (scale >= 0.92) {
+        const overflow = Math.max(0, scale - 1);
+        travelX = 0.45 + overflow * 1.15;
+        travelY = 0.95 + overflow * 1.7;
+    }
+    const xn = ((Number(x) || 0) - 50) / 50;
+    const yn = ((Number(y) || 0) - 50) / 50;
+    return { x: xn * travelX, y: -yn * travelY };
+}
+
 // Set 3D scale
 function setThreeJSScale(scale) {
     if (!phoneModel) return;
@@ -750,17 +767,15 @@ function renderThreeJSToCanvas(targetCanvas, width, height) {
         // Use getScreenshotSettings() helper if available, otherwise fall back to defaults
         const ss = typeof getScreenshotSettings === 'function' ? getScreenshotSettings() : state.defaults?.screenshot;
         if (ss) {
-            // Scale: use screenshot.scale to adjust model size
+            // Scale: use screenshot.scale to adjust model size (100 = fit, above 100 zooms)
             const screenshotScale = ss.scale / 100;
             phonePivot.scale.setScalar(screenshotScale);
 
-            // Position: match 2D behavior where available space depends on (1 - scale)
-            // This ensures same percentages look the same in 2D and 3D
-            // X uses smaller factor (1.1) since canvas is taller than wide (400x700 aspect)
-            const availableSpaceY = (1 - screenshotScale) * 2;
-            const availableSpaceX = (1 - screenshotScale) * 0.9;
-            const xOffset = ((ss.x - 50) / 50) * availableSpaceX;
-            const yOffset = -((ss.y - 50) / 50) * availableSpaceY; // Inverted for 3D
+            // Position keeps a travel range once the device fills the frame, so x/y can
+            // push it off the canvas (intentional crop) instead of collapsing at 100%+.
+            const framed = deviceFramingOffset(ss.scale, ss.x, ss.y);
+            const xOffset = framed.x;
+            const yOffset = framed.y;
             phonePivot.position.set(
                 xOffset + basePositionOffset.x,
                 yOffset + basePositionOffset.y,
@@ -903,13 +918,12 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
         (rotation3D.z + modelRot.z) * Math.PI / 180
     );
 
-    // Apply scale and position (matching 2D behavior)
+    // Apply scale and position. Scales above 100% and x/y outside 0–100 bleed off-canvas.
     const screenshotScale = ss.scale / 100;
     pivotToUse.scale.setScalar(screenshotScale);
-    const availableSpaceY = (1 - screenshotScale) * 2;
-    const availableSpaceX = (1 - screenshotScale) * 0.9;
-    const xOffset = ((ss.x - 50) / 50) * availableSpaceX;
-    const yOffset = -((ss.y - 50) / 50) * availableSpaceY;
+    const framed = deviceFramingOffset(ss.scale, ss.x, ss.y);
+    const xOffset = framed.x;
+    const yOffset = framed.y;
     pivotToUse.position.set(
         xOffset + basePositionOffset.x,
         yOffset + basePositionOffset.y,
@@ -1095,8 +1109,8 @@ function setup3DCanvasInteraction() {
 
         if (isAltDragging) {
             // Alt+drag: move position (x, y)
-            ss.x = Math.max(0, Math.min(100, ss.x + deltaX * 0.2));
-            ss.y = Math.max(0, Math.min(100, ss.y + deltaY * 0.2));
+            ss.x = Math.max(-80, Math.min(180, ss.x + deltaX * 0.2));
+            ss.y = Math.max(-80, Math.min(180, ss.y + deltaY * 0.2));
 
             // Update sliders
             document.getElementById('screenshot-x').value = ss.x;
@@ -1107,8 +1121,8 @@ function setup3DCanvasInteraction() {
             // Regular drag: rotate
             if (!ss.rotation3D) ss.rotation3D = { x: 0, y: 0, z: 0 };
 
-            ss.rotation3D.y = Math.max(-45, Math.min(45, ss.rotation3D.y + deltaX * 0.5));
-            ss.rotation3D.x = Math.max(-45, Math.min(45, ss.rotation3D.x + deltaY * 0.5));
+            ss.rotation3D.y = Math.max(-180, Math.min(180, ss.rotation3D.y + deltaX * 0.5));
+            ss.rotation3D.x = Math.max(-180, Math.min(180, ss.rotation3D.x + deltaY * 0.5));
 
             // Update sliders
             document.getElementById('rotation-3d-y').value = ss.rotation3D.y;

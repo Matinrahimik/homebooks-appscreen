@@ -1,0 +1,26 @@
+{
+  "main_module": "worker.js",
+  "compatibility_date": "2026-10-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "bindings": [
+    {
+      "type": "kv_namespace",
+      "name": "APPSCREEN_KV",
+      "namespace_id": "__KV_NAMESPACE_ID__"
+    },
+    {
+      "type": "browser",
+      "name": "BROWSER"
+    },
+    {
+      "type": "plain_text",
+      "name": "PAGES_ORIGIN",
+      "text": "https://matinrahimik.github.io"
+    },
+    {
+      "type": "plain_text",
+      "name": "PAGES_PATH",
+      "text": "/homebooks-appscreen/"
+    }
+  ]
+}

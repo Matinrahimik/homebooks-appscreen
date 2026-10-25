@@ -549,6 +549,13 @@ html.tauri-app .right-sidebar {
     margin-bottom: 20px;
 }
 
+.control-hint {
+    margin: 6px 0 10px;
+    color: var(--text-secondary, #9aa0a6);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
 .control-label {
     display: block;
     font-size: 12px;
@@ -3526,4 +3533,51 @@ input[type="range"]::-webkit-slider-thumb {
 .element-item-thumb .emoji-thumb {
     font-size: 18px;
     line-height: 1;
+}
+
+/* Live project sync (only visible with ?project=&key=) */
+.live-sync-status {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+/* Headless render mode (?render=). The canvas keeps its export pixel size. */
+html.render-mode,
+html.render-mode body {
+    background: transparent;
+    overflow: auto;
+    height: auto;
+    min-height: 0;
+}
+
+html.render-mode .app-container {
+    display: block;
+    min-height: 0;
+    max-height: none;
+}
+
+html.render-mode .sidebar,
+html.render-mode .modal-overlay,
+html.render-mode .side-preview,
+html.render-mode .no-screenshot,
+html.render-mode .live-sync-status {
+    display: none !important;
+}
+
+html.render-mode .canvas-area,
+html.render-mode .preview-strip,
+html.render-mode .canvas-wrapper {
+    display: block;
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    transform: none;
+}
+
+html.render-mode #preview-canvas {
+    display: block;
+    max-width: none;
+    max-height: none;
 }

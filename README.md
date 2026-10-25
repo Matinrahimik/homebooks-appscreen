@@ -5,6 +5,8 @@ A free, open-source tool for creating beautiful App Store screenshots with custo
 
 **[Start using it now. Hosted on GitHub Pages](https://yuzu-hub.github.io/appscreen/)**
 
+This fork also publishes the designer for HomeBooks at [matinrahimik.github.io/homebooks-appscreen](https://matinrahimik.github.io/homebooks-appscreen/). Agents can build the same projects through the MCP server documented in [worker/README.md](worker/README.md). Open a live project with `?project=<id>&key=<editKey>` to edit it by hand; the page loads and saves the existing project-backup JSON.
+
 ![App Store Screenshot Generator](img/screenshot-generator.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

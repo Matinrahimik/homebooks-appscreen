@@ -1,6 +1,29 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <script>
+        (function () {
+            var path = location.pathname;
+            var base = '/';
+            if (path === '/homebooks-appscreen' || path.indexOf('/homebooks-appscreen/') === 0) {
+                base = '/homebooks-appscreen/';
+            }
+            var el = document.createElement('base');
+            el.href = base;
+            document.head.appendChild(el);
+            window.APP_ASSET_BASE = base;
+            var q = new URLSearchParams(location.search);
+            if (q.has('render')) {
+                document.documentElement.classList.add('render-mode');
+                var style = document.createElement('style');
+                style.textContent = 'html.render-mode .sidebar{display:none!important}html.render-mode .app-container{display:block}';
+                document.head.appendChild(style);
+            }
+            if (q.get('project') && q.get('key')) {
+                document.documentElement.classList.add('live-project');
+            }
+        })();
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>App Store Screenshot Generator</title>
@@ -509,6 +532,62 @@
                             <span class="range-value" id="bg-overlay-opacity-value">0%</span>
                         </div>
                     </div>
+                    <div class="control-group">
+                        <label class="control-label">Image Offset X</label>
+                        <div class="control-row">
+                            <input type="range" id="bg-image-offset-x" min="-100" max="100" value="0">
+                            <span class="range-value" id="bg-image-offset-x-value">0%</span>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label class="control-label">Image Offset Y</label>
+                        <div class="control-row">
+                            <input type="range" id="bg-image-offset-y" min="-100" max="100" value="0">
+                            <span class="range-value" id="bg-image-offset-y-value">0%</span>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label class="control-label">Image Scale</label>
+                        <div class="control-row">
+                            <input type="range" id="bg-image-scale" min="50" max="200" value="100">
+                            <span class="range-value" id="bg-image-scale-value">100%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="divider"></div>
+                <div class="control-group">
+                    <div class="toggle-row">
+                        <span class="toggle-label">Panoramic background</span>
+                        <div class="toggle" id="panoramic-toggle"></div>
+                    </div>
+                    <p class="control-hint">One wide image is sliced across screenshots in order.</p>
+                    <div class="bg-image-upload" id="panoramic-upload">
+                        <p>Click to upload a wide image</p>
+                    </div>
+                    <input type="file" id="panoramic-input" accept="image/*" hidden>
+                    <img class="bg-image-preview" id="panoramic-preview" style="display: none;">
+                    <div class="control-group">
+                        <label class="control-label">Slice Overlap</label>
+                        <div class="control-row">
+                            <input type="range" id="panoramic-overlap" min="0" max="80" value="0">
+                            <span class="range-value" id="panoramic-overlap-value">0%</span>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label class="control-label">Panoramic Scale</label>
+                        <div class="control-row">
+                            <input type="range" id="panoramic-scale" min="50" max="200" value="100">
+                            <span class="range-value" id="panoramic-scale-value">100%</span>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label class="control-label">Panoramic Offset Y</label>
+                        <div class="control-row">
+                            <input type="range" id="panoramic-offset-y" min="-100" max="100" value="0">
+                            <span class="range-value" id="panoramic-offset-y-value">0%</span>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="divider"></div>
@@ -556,21 +635,21 @@
                     <div class="control-group">
                         <label class="control-label">Rotation X (Tilt)</label>
                         <div class="control-row">
-                            <input type="range" id="rotation-3d-x" min="-45" max="45" value="0">
+                            <input type="range" id="rotation-3d-x" min="-180" max="180" value="0">
                             <span class="range-value" id="rotation-3d-x-value">0°</span>
                         </div>
                     </div>
                     <div class="control-group">
                         <label class="control-label">Rotation Y (Turn)</label>
                         <div class="control-row">
-                            <input type="range" id="rotation-3d-y" min="-45" max="45" value="0">
+                            <input type="range" id="rotation-3d-y" min="-180" max="180" value="0">
                             <span class="range-value" id="rotation-3d-y-value">0°</span>
                         </div>
                     </div>
                     <div class="control-group">
                         <label class="control-label">Rotation Z (Roll)</label>
                         <div class="control-row">
-                            <input type="range" id="rotation-3d-z" min="-45" max="45" value="0">
+                            <input type="range" id="rotation-3d-z" min="-180" max="180" value="0">
                             <span class="range-value" id="rotation-3d-z-value">0°</span>
                         </div>
                     </div>
@@ -646,7 +725,7 @@
                 <div class="control-group">
                     <label class="control-label">Screenshot Scale</label>
                     <div class="control-row">
-                        <input type="range" id="screenshot-scale" min="30" max="100" value="70">
+                        <input type="range" id="screenshot-scale" min="30" max="200" value="70">
                         <span class="range-value" id="screenshot-scale-value">70%</span>
                     </div>
                 </div>
@@ -686,7 +765,7 @@
                     <div class="control-group">
                         <label class="control-label">Tilt / Rotation</label>
                         <div class="control-row">
-                            <input type="range" id="screenshot-rotation" min="-45" max="45" value="0">
+                            <input type="range" id="screenshot-rotation" min="-180" max="180" value="0">
                             <span class="range-value" id="screenshot-rotation-value">0°</span>
                         </div>
                     </div>
@@ -832,7 +911,7 @@
                                     <circle cx="11" cy="11" r="8"/>
                                     <path d="M21 21l-4.35-4.35"/>
                                 </svg>
-                                <input type="text" id="font-search" placeholder="Search fonts..." autocomplete="off">
+                                <input type="text" id="font-search" placeholder="Search or type any Google Font" autocomplete="off">
                             </div>
                             <div class="font-picker-categories">
                                 <button class="font-category active" data-category="popular">Popular</button>
@@ -910,6 +989,24 @@
                         <span class="range-value" id="line-height-value">110%</span>
                     </div>
                 </div>
+                <div class="control-group">
+                    <label class="control-label">Headline / Subheadline Gap</label>
+                    <div class="control-row">
+                        <input type="range" id="text-gap" min="0" max="400" value="10">
+                        <span class="range-value" id="text-gap-value">10px</span>
+                    </div>
+                    <select id="text-gap-unit">
+                        <option value="px">Pixels</option>
+                        <option value="percent">Percent of canvas height</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Headline Letter Spacing</label>
+                    <div class="control-row">
+                        <input type="range" id="headline-letter-spacing" min="-20" max="80" value="0">
+                        <span class="range-value" id="headline-letter-spacing-value">0px</span>
+                    </div>
+                </div>
                 </div><!-- end headline-options -->
 
                 <div class="divider"></div>
@@ -953,7 +1050,7 @@
                                     <circle cx="11" cy="11" r="8"/>
                                     <path d="M21 21l-4.35-4.35"/>
                                 </svg>
-                                <input type="text" id="subheadline-font-search" placeholder="Search fonts..." autocomplete="off">
+                                <input type="text" id="subheadline-font-search" placeholder="Search or type any Google Font" autocomplete="off">
                             </div>
                             <div class="font-picker-categories">
                                 <button class="font-category active" data-category="popular">Popular</button>
@@ -966,6 +1063,13 @@
                         </div>
                     </div>
                     <input type="hidden" id="subheadline-font" value="-apple-system, BlinkMacSystemFont, 'SF Pro Display'">
+                    <div class="control-group">
+                        <label class="control-label">Subheadline Letter Spacing</label>
+                        <div class="control-row">
+                            <input type="range" id="subheadline-letter-spacing" min="-20" max="80" value="0">
+                            <span class="range-value" id="subheadline-letter-spacing-value">0px</span>
+                        </div>
+                    </div>
                     <div class="text-style-bar" id="subheadline-style">
                         <input type="number" id="subheadline-size" min="12" max="200" value="50" title="Font Size">
                         <input type="color" id="subheadline-color" value="#ffffff" title="Text Color">
@@ -1965,6 +2069,8 @@
     <script src="magical-titles.js"></script>
     <script src="lucide-icons.js"></script>
     <script src="three-renderer.js"></script>
+    <script src="backup-state.js"></script>
+    <script src="live-sync.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
