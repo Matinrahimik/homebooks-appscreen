@@ -125,9 +125,11 @@
         if (!live) return;
         showLiveStatus('Loading live project…');
         var res;
+        if (isRenderMode() && database) await clearProjectStores(database);
         try {
-            res = await fetch(apiBase + '/api/projects/' + encodeURIComponent(projectId), {
-                headers: { 'X-Edit-Key': editKey, 'Accept': 'application/json' }
+            res = await fetch(apiBase + '/api/projects/' + encodeURIComponent(projectId) + '?cb=' + Date.now(), {
+                cache: 'no-store',
+                headers: { 'X-Edit-Key': editKey, 'Accept': 'application/json', 'Cache-Control': 'no-store' }
             });
         } catch (e) {
             pullFailed = true;
@@ -266,6 +268,21 @@
         return new Promise(function (resolve) { setTimeout(resolve, ms); });
     }
 
+    function clearProjectStores(database) {
+        return new Promise(function (resolve) {
+            try {
+                var tx = database.transaction(['projects', 'meta'], 'readwrite');
+                tx.objectStore('projects').clear();
+                tx.objectStore('meta').clear();
+                tx.oncomplete = function () { resolve(); };
+                tx.onerror = function () { resolve(); };
+                tx.onabort = function () { resolve(); };
+            } catch (e) {
+                resolve();
+            }
+        });
+    }
+
     function quotedFonts(value) {
         if (!value || typeof value !== 'string') return [];
         var found = [];
@@ -278,40 +295,89 @@
         return found;
     }
 
+    function readyApi() {
+        return window.AppscreenReady;
+    }
+
     async function waitForScreenshots() {
-        var deadline = Date.now() + 30000;
+        var deadline = Date.now() + 60000;
         while (Date.now() < deadline) {
             if (pullFailed) throw new Error(window.__appscreenError || 'Project failed to load');
+            var api = readyApi();
+            if (api && api.pullStillRunning(live, pullDone, pullFailed)) {
+                await sleep(40);
+                continue;
+            }
+            if (live && !pullDone) {
+                await sleep(40);
+                continue;
+            }
             var count = (state.screenshots || []).filter(Boolean).length;
-            if (!live || expectedScreenshots === 0 || count >= expectedScreenshots) {
+            var expected = live ? expectedScreenshots : (state.screenshots || []).length;
+            if (expected === 0 || count >= expected) {
                 var missing = false;
-                for (var i = 0; i < (live ? expectedScreenshots : 0); i++) {
+                for (var i = 0; i < expected; i++) {
                     if (!state.screenshots[i]) missing = true;
                 }
-                if (!missing) break;
+                if (!missing) return;
             }
             await sleep(40);
         }
+        throw new Error('Screenshots did not finish loading');
     }
 
-    async function prepareFrame() {
-        await waitForScreenshots();
-        if (renderTarget !== 'all' && renderTarget !== 'invalid' && typeof renderTarget === 'number') {
-            if (state.screenshots.length > renderTarget) state.selectedIndex = renderTarget;
+    async function waitImage(img, label) {
+        var deadline = Date.now() + 60000;
+        var api = readyApi();
+        while (Date.now() < deadline) {
+            var status = api
+                ? api.imageState(img, label)
+                : (img && img.complete && img.naturalWidth > 0
+                    ? { state: 'ok', message: '' }
+                    : (img && img.complete ? { state: 'error', message: label + ' failed to load' } : { state: 'pending', message: '' }));
+            if (status.state === 'error') throw new Error(status.message);
+            if (status.state === 'ok') {
+                if (img.decode) {
+                    try {
+                        await img.decode();
+                    } catch (e) {
+                        var src = img.currentSrc || img.src || '';
+                        var named = api ? api.assetLabel(src) : src;
+                        throw new Error(label + ' (' + named + ') failed to decode');
+                    }
+                }
+                if (!(img.naturalWidth > 0)) throw new Error(label + ' failed to decode');
+                return;
+            }
+            await sleep(40);
         }
-        var shot = state.screenshots[state.selectedIndex];
-        function waitImage(img) {
-            if (!img || img.complete) return Promise.resolve();
-            return new Promise(function (resolve) {
-                img.addEventListener('load', resolve, { once: true });
-                img.addEventListener('error', resolve, { once: true });
-            });
+        var lateSrc = img && (img.currentSrc || img.src) || '';
+        var lateName = api ? api.assetLabel(lateSrc) : (lateSrc || 'image');
+        throw new Error(label + ' (' + lateName + ') did not load in time');
+    }
+
+    function frameImages(index) {
+        var shot = state.screenshots[index];
+        if (!shot) throw new Error('Screenshot index ' + index + ' is not loaded');
+        var api = readyApi();
+        var images = [];
+        var src = api ? api.screenshotSource(shot, state.currentLanguage) : (shot.src || '');
+        if (src) {
+            var photo = typeof getScreenshotImage === 'function' ? getScreenshotImage(shot) : shot.image;
+            images.push({ img: photo, label: 'Screenshot ' + index });
         }
-        if (shot && typeof getScreenshotImage === 'function') {
-            await waitImage(getScreenshotImage(shot));
+        var bg = shot.background;
+        if (bg && (bg.type === 'image' || bg.imageSrc)) {
+            images.push({ img: bg.image, label: 'Background image for screenshot ' + index });
         }
-        if (shot && shot.background) await waitImage(shot.background.image);
-        if (state.panoramicBackground) await waitImage(state.panoramicBackground.image);
+        var pano = state.panoramicBackground;
+        if (pano && pano.enabled && pano.src) {
+            images.push({ img: pano.image, label: 'Panoramic background' });
+        }
+        return images;
+    }
+
+    async function waitForFonts(shot) {
         var text = shot && shot.text ? shot.text : (state.defaults && state.defaults.text);
         var fonts = quotedFonts(text && text.headlineFont).concat(quotedFonts(text && text.subheadlineFont));
         var weights = [];
@@ -334,22 +400,59 @@
         if (document.fonts && document.fonts.ready) {
             try { await document.fonts.ready; } catch (e) { /* ignore */ }
         }
+    }
+
+    async function waitForDevice(shot, index) {
         var ss = shot && shot.screenshot;
-        if (ss && ss.use3D) {
-            if (typeof showThreeJS === 'function') showThreeJS(true);
-            if (typeof switchPhoneModel === 'function') switchPhoneModel(ss.device3D || 'iphone');
-            var started = Date.now();
-            while (typeof phoneModelLoaded !== 'undefined' && !phoneModelLoaded && Date.now() - started < 40000) {
-                await sleep(100);
-            }
-            if (typeof phoneModelLoaded !== 'undefined' && !phoneModelLoaded) {
-                throw new Error('3D device model did not finish loading');
-            }
+        if (!ss || !ss.use3D) return;
+        if (typeof showThreeJS === 'function') showThreeJS(true);
+        if (typeof switchPhoneModel === 'function') switchPhoneModel(ss.device3D || 'iphone');
+        var started = Date.now();
+        while (typeof phoneModelLoaded !== 'undefined' && !phoneModelLoaded && Date.now() - started < 40000) {
+            await sleep(100);
         }
+        if (typeof phoneModelLoaded !== 'undefined' && !phoneModelLoaded) {
+            throw new Error('3D device model did not finish loading for screenshot ' + index);
+        }
+    }
+
+    function assertTexture(shot, index) {
+        var ss = shot && shot.screenshot;
+        if (!ss || !ss.use3D) return;
+        var api = readyApi();
+        var src = api ? api.screenshotSource(shot, state.currentLanguage) : '';
+        var named = api ? api.assetLabel(src) : (src || 'image');
+        if (typeof screenTexture === 'undefined' || !screenTexture || !screenTexture.image || !(screenTexture.image.width > 0)) {
+            throw new Error('3D screen texture did not load for screenshot ' + index + ' (' + named + ')');
+        }
+    }
+
+    async function paintIndex(index) {
+        if (!state.screenshots[index]) throw new Error('Screenshot index ' + index + ' is not loaded');
+        state.selectedIndex = index;
+        if (typeof syncUIWithState === 'function') syncUIWithState();
+        var images = frameImages(index);
+        for (var i = 0; i < images.length; i++) await waitImage(images[i].img, images[i].label);
+        var shot = state.screenshots[index];
+        await waitForFonts(shot);
+        await waitForDevice(shot, index);
         if (typeof updateCanvas === 'function') updateCanvas();
         await new Promise(function (resolve) {
             requestAnimationFrame(function () { requestAnimationFrame(resolve); });
         });
+        assertTexture(shot, index);
+    }
+
+    async function prepareFrame(onlyIndex) {
+        await waitForScreenshots();
+        var indexes = [];
+        if (typeof onlyIndex === 'number') indexes = [onlyIndex];
+        else if (renderTarget === 'all') {
+            for (var i = 0; i < state.screenshots.length; i++) indexes.push(i);
+        } else if (typeof renderTarget === 'number') indexes = [renderTarget];
+        else indexes = [state.selectedIndex || 0];
+        if (live && indexes.length === 0) throw new Error('Project has no screenshots to render');
+        for (var n = 0; n < indexes.length; n++) await paintIndex(indexes[n]);
     }
 
     function snapshot() {
@@ -373,7 +476,7 @@
         }
         checking = true;
         try {
-            await prepareFrame();
+            await prepareFrame(typeof index === 'number' ? index : undefined);
         } finally {
             checking = false;
         }
@@ -396,6 +499,7 @@
             markReady();
         }).catch(function (error) {
             checking = false;
+            console.error(error);
             markError(error && error.message ? error.message : String(error));
         });
     }

@@ -544,6 +544,11 @@ function applyEffectiveLayout(text: Record<string, unknown>, settings: Record<st
   text.languageSettings = current;
 }
 
+function hasVisibleCopy(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  return Object.values(value).some((item) => typeof item === "string" && item.trim() !== "");
+}
+
 function applyTextShortcuts(text: Record<string, unknown>, settings: Record<string, unknown>, lang: string): void {
   if (typeof settings.headline === "string") {
     const headlines = { ...((text.headlines as Record<string, string>) || {}) };
@@ -563,8 +568,14 @@ function applyTextShortcuts(text: Record<string, unknown>, settings: Record<stri
     text.subheadlineLanguages = [...langs];
     text.currentSubheadlineLang = lang;
   }
-  if (isPlainObject(settings.headlines)) text.headlines = { ...(text.headlines as object), ...settings.headlines };
-  if (isPlainObject(settings.subheadlines)) text.subheadlines = { ...(text.subheadlines as object), ...settings.subheadlines };
+  if (isPlainObject(settings.headlines)) {
+    text.headlines = { ...(text.headlines as object), ...settings.headlines };
+    if (hasVisibleCopy(settings.headlines)) text.headlineEnabled = true;
+  }
+  if (isPlainObject(settings.subheadlines)) {
+    text.subheadlines = { ...(text.subheadlines as object), ...settings.subheadlines };
+    if (hasVisibleCopy(settings.subheadlines)) text.subheadlineEnabled = true;
+  }
   for (const key of TEXT_SHORTCUTS) {
     if (key === "headline" || key === "subheadline" || key === "headlines" || key === "subheadlines") continue;
     if (key === "languageSettings") continue;
@@ -998,27 +1009,106 @@ export function outputSizeOf(project: ProjectRecord): { device: string; width: n
   return { device: project.outputDevice, width: spec.width, height: spec.height };
 }
 
-export function summarizeScreenshot(shot: ScreenshotRecord, index: number): Record<string, unknown> {
+function numberSetting(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function effectiveLayoutNumber(text: Record<string, unknown>, key: string, lang: string): number | null {
+  const settings = text.languageSettings;
+  if (settings && typeof settings === "object") {
+    const entry = (settings as Record<string, unknown>)[lang];
+    if (entry && typeof entry === "object") {
+      const sized = numberSetting((entry as Record<string, unknown>)[key]);
+      if (sized != null) return sized;
+    }
+  }
+  return numberSetting(text[key]);
+}
+
+export function screenshotImageRef(shot: ScreenshotRecord, lang: string): string {
+  const localized = shot.localizedImages || {};
+  const order = [lang, "en", ...Object.keys(localized)];
+  for (const code of order) {
+    const src = localized[code]?.src;
+    if (src) return src;
+  }
+  return shot.src || "";
+}
+
+export function summarizePanorama(project: ProjectRecord): Record<string, unknown> {
+  const raw = project.panoramicBackground;
+  const pano = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const src = typeof pano.src === "string" ? pano.src : "";
+  return {
+    enabled: pano.enabled === true,
+    hasImage: Boolean(src),
+    overlap: typeof pano.overlap === "number" ? pano.overlap : 0,
+    scale: typeof pano.scale === "number" ? pano.scale : 100,
+    offsetY: typeof pano.offsetY === "number" ? pano.offsetY : 0,
+    src: src.startsWith("data:") ? "data-url" : src,
+  };
+}
+
+export function summarizeScreenshot(shot: ScreenshotRecord, index: number, lang = "en", panoramaActive = false): Record<string, unknown> {
   const text = shot.text || {};
   const headlines = (text.headlines as Record<string, string>) || {};
   const subheadlines = (text.subheadlines as Record<string, string>) || {};
   const langs = Object.keys(shot.localizedImages || {});
+  const background = (shot.background || {}) as Record<string, unknown>;
+  const type = typeof background.type === "string" ? background.type : "gradient";
+  const imageSrc = typeof background.imageSrc === "string"
+    ? background.imageSrc
+    : typeof background.image === "string"
+      ? background.image
+      : "";
   return {
     index,
     name: shot.name,
     deviceType: shot.deviceType || null,
     languages: langs,
-    hasImage: langs.some((lang) => Boolean(shot.localizedImages[lang]?.src)) || Boolean(shot.src),
+    hasImage: langs.some((code) => Boolean(shot.localizedImages[code]?.src)) || Boolean(shot.src),
     background: shot.background,
+    backgroundState: {
+      type,
+      hasImage: Boolean(imageSrc),
+      effective: panoramaActive ? "panorama" : type,
+    },
     screenshot: shot.screenshot,
     headlines,
     subheadlines,
+    headlineEnabled: text.headlineEnabled !== false,
+    subheadlineEnabled: text.subheadlineEnabled === true,
     headlineFont: text.headlineFont,
     subheadlineFont: text.subheadlineFont,
+    headlineWeight: text.headlineWeight ?? null,
+    subheadlineWeight: text.subheadlineWeight ?? null,
+    headlineSize: numberSetting(text.headlineSize),
+    subheadlineSize: numberSetting(text.subheadlineSize),
+    effectiveHeadlineSize: effectiveLayoutNumber(text, "headlineSize", lang),
+    effectiveSubheadlineSize: effectiveLayoutNumber(text, "subheadlineSize", lang),
+    headlineTextWrap: text.headlineTextWrap || "wrap",
+    subheadlineTextWrap: text.subheadlineTextWrap || "wrap",
     headlineColor: text.headlineColor,
     subheadlineColor: text.subheadlineColor,
     position: text.position,
   };
+}
+
+export interface RenderFrameSource {
+  image: string;
+  panorama: boolean;
+}
+
+/** Image identity for each screenshot, used to reject identical captures of different photos. */
+export function renderSourceKeys(dump: BackupDump): RenderFrameSource[] {
+  const project = primaryProject(dump);
+  const panorama = summarizePanorama(project);
+  const active = panorama.enabled === true && panorama.hasImage === true;
+  const lang = project.currentLanguage || "en";
+  return project.screenshots.map((shot) => ({
+    image: screenshotImageRef(shot, lang),
+    panorama: active,
+  }));
 }
 
 function redactDataUrls(value: unknown): unknown {
@@ -1035,6 +1125,9 @@ function redactDataUrls(value: unknown): unknown {
 /** Strip bulky data URLs so get_project stays readable. */
 export function backupSummary(dump: BackupDump): Record<string, unknown> {
   const project = primaryProject(dump);
+  const panorama = summarizePanorama(project);
+  const panoramaActive = panorama.enabled === true && panorama.hasImage === true;
+  const lang = project.currentLanguage || "en";
   return redactDataUrls({
     id: project.id,
     name: projectName(dump),
@@ -1044,8 +1137,9 @@ export function backupSummary(dump: BackupDump): Record<string, unknown> {
     projectLanguages: project.projectLanguages,
     selectedIndex: project.selectedIndex,
     screenshotCount: project.screenshots.length,
+    panoramicBackground: panorama,
     defaults: project.defaults,
-    screenshots: project.screenshots.map((shot, index) => summarizeScreenshot(shot, index)),
+    screenshots: project.screenshots.map((shot, index) => summarizeScreenshot(shot, index, lang, panoramaActive)),
   }) as Record<string, unknown>;
 }
 

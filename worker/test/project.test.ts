@@ -6,6 +6,7 @@ import {
   createBackup,
   dataUrlFromBytes,
   POSITION_PRESETS,
+  backupSummary,
   primaryProject,
   removeScreenshot,
   reorderScreenshots,
@@ -246,6 +247,56 @@ describe("backup mutations", () => {
         `${width}x${height} device top ${top.toFixed(1)} overlaps text ending at ${textEnd.toFixed(1)}`,
       );
     }
+  });
+
+  it("turns subheadline maps on and keeps an explicit disable", () => {
+    const dump = createBackup("p1", "HomeBooks");
+    addScreenshot(dump, { dataUrl: PNG, name: "one.png" });
+    const text = primaryProject(dump).screenshots[0].text;
+    assert.equal(text.subheadlineEnabled, false);
+    text.headlineEnabled = false;
+    updateScreenshotSettings(dump, 0, { headlines: { en: "Shown" }, subheadlines: { en: "Also shown" } });
+    assert.equal(text.headlineEnabled, true);
+    assert.equal(text.subheadlineEnabled, true);
+    assert.equal((text.subheadlines as { en: string }).en, "Also shown");
+    updateScreenshotSettings(dump, 0, { subheadline: "Kept", subheadlineEnabled: false });
+    assert.equal(text.subheadlineEnabled, false);
+    assert.equal((text.subheadlines as { en: string }).en, "Kept");
+  });
+
+  it("summarizes the panorama, wrap, size, and weight without the image bytes", () => {
+    const dump = createBackup("p1", "HomeBooks");
+    addScreenshot(dump, { dataUrl: PNG, name: "one.png" });
+    updateScreenshotSettings(dump, 0, {
+      headlineSize: 88,
+      headlineTextWrap: "balance",
+      subheadlineTextWrap: "balance",
+      font_weight: "600",
+      background: { type: "gradient" },
+    });
+    setPanoramicBackground(dump, { src: PNG, overlap: 0.2, scale: 110, offsetY: 4 });
+    const summary = backupSummary(dump);
+    const panorama = summary.panoramicBackground as { enabled: boolean; hasImage: boolean; overlap: number; src: string };
+    assert.equal(panorama.enabled, true);
+    assert.equal(panorama.hasImage, true);
+    assert.equal(panorama.overlap, 0.2);
+    assert.equal(panorama.src, "data-url");
+    const shot = (summary.screenshots as {
+      backgroundState: { type: string; effective: string };
+      headlineSize: number;
+      effectiveHeadlineSize: number;
+      headlineWeight: string;
+      headlineTextWrap: string;
+      subheadlineTextWrap: string;
+    }[])[0];
+    assert.equal(shot.backgroundState.type, "gradient");
+    assert.equal(shot.backgroundState.effective, "panorama");
+    assert.equal(shot.headlineSize, 88);
+    assert.equal(shot.effectiveHeadlineSize, 88);
+    assert.equal(shot.headlineWeight, "600");
+    assert.equal(shot.headlineTextWrap, "balance");
+    assert.equal(shot.subheadlineTextWrap, "balance");
+    assert.equal(JSON.stringify(summary).includes(PNG), false);
   });
 
   it("parses a UI gradient preset into stops", () => {

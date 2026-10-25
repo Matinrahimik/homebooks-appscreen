@@ -14,9 +14,17 @@ interface GateState {
 }
 
 interface GateBody {
-  op: "read" | "cas" | "replace" | "delete";
+  op: "read" | "cas" | "replace" | "delete" | "acquire" | "release";
   expected?: number;
   doc?: string;
+  lock?: string;
+  token?: string;
+  ttlMs?: number;
+}
+
+interface HeldLock {
+  token: string;
+  until: number;
 }
 
 export class ProjectGate {
@@ -54,6 +62,9 @@ export class ProjectGate {
       const doc = await storage.get("doc");
       return Response.json({ version, doc: typeof doc === "string" ? doc : null });
     }
+    if (body.op === "acquire" || body.op === "release") {
+      return lockOp(storage, body);
+    }
     const run = async (txn: GateStorage): Promise<Response> => {
       if (body.op === "delete") {
         await txn.delete("doc");
@@ -83,6 +94,44 @@ export class ProjectGate {
     if (typeof storage.transaction === "function") return storage.transaction(run);
     return run(storage);
   }
+}
+
+function lockKey(name: string | undefined): string {
+  const safe = name && /^[a-z0-9_-]{1,32}$/i.test(name) ? name : "render";
+  return `lock:${safe}`;
+}
+
+async function readLock(storage: GateStorage, key: string): Promise<HeldLock | null> {
+  const raw = await storage.get(key);
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as HeldLock;
+    if (!parsed || typeof parsed.token !== "string" || typeof parsed.until !== "number") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** Exclusive render lock. Expired locks are stolen so a crashed render cannot wedge the project. */
+async function lockOp(storage: GateStorage, body: GateBody): Promise<Response> {
+  const key = lockKey(body.lock);
+  const now = Date.now();
+  if (body.op === "release") {
+    const current = await readLock(storage, key);
+    if (current && current.token === body.token) await storage.delete(key);
+    return Response.json({ ok: true });
+  }
+  const token = body.token || "";
+  if (!token) return Response.json({ ok: false, error: "lock token is required" }, { status: 400 });
+  const current = await readLock(storage, key);
+  if (current && current.until > now && current.token !== token) {
+    return Response.json({ ok: false, retryMs: 100 });
+  }
+  const ttl = Number.isFinite(body.ttlMs) ? Math.min(Math.max(body.ttlMs || 0, 1000), 300_000) : 180_000;
+  const until = now + ttl;
+  await storage.put(key, JSON.stringify({ token, until }));
+  return Response.json({ ok: true, until });
 }
 
 class MemoryStorage implements GateStorage {

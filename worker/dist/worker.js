@@ -21052,6 +21052,10 @@ function applyEffectiveLayout(text, settings, lang) {
   }
   text.languageSettings = current;
 }
+function hasVisibleCopy(value) {
+  if (!isPlainObject(value)) return false;
+  return Object.values(value).some((item) => typeof item === "string" && item.trim() !== "");
+}
 function applyTextShortcuts(text, settings, lang) {
   if (typeof settings.headline === "string") {
     const headlines = { ...text.headlines || {} };
@@ -21071,8 +21075,14 @@ function applyTextShortcuts(text, settings, lang) {
     text.subheadlineLanguages = [...langs];
     text.currentSubheadlineLang = lang;
   }
-  if (isPlainObject(settings.headlines)) text.headlines = { ...text.headlines, ...settings.headlines };
-  if (isPlainObject(settings.subheadlines)) text.subheadlines = { ...text.subheadlines, ...settings.subheadlines };
+  if (isPlainObject(settings.headlines)) {
+    text.headlines = { ...text.headlines, ...settings.headlines };
+    if (hasVisibleCopy(settings.headlines)) text.headlineEnabled = true;
+  }
+  if (isPlainObject(settings.subheadlines)) {
+    text.subheadlines = { ...text.subheadlines, ...settings.subheadlines };
+    if (hasVisibleCopy(settings.subheadlines)) text.subheadlineEnabled = true;
+  }
   for (const key of TEXT_SHORTCUTS) {
     if (key === "headline" || key === "subheadline" || key === "headlines" || key === "subheadlines") continue;
     if (key === "languageSettings") continue;
@@ -21464,27 +21474,91 @@ function outputSizeOf(project) {
   const spec = OUTPUT_DEVICES[project.outputDevice];
   return { device: project.outputDevice, width: spec.width, height: spec.height };
 }
-function summarizeScreenshot(shot, index) {
+function numberSetting(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+function effectiveLayoutNumber(text, key, lang) {
+  const settings = text.languageSettings;
+  if (settings && typeof settings === "object") {
+    const entry = settings[lang];
+    if (entry && typeof entry === "object") {
+      const sized = numberSetting(entry[key]);
+      if (sized != null) return sized;
+    }
+  }
+  return numberSetting(text[key]);
+}
+function screenshotImageRef(shot, lang) {
+  const localized = shot.localizedImages || {};
+  const order = [lang, "en", ...Object.keys(localized)];
+  for (const code of order) {
+    const src = localized[code]?.src;
+    if (src) return src;
+  }
+  return shot.src || "";
+}
+function summarizePanorama(project) {
+  const raw = project.panoramicBackground;
+  const pano = raw && typeof raw === "object" ? raw : {};
+  const src = typeof pano.src === "string" ? pano.src : "";
+  return {
+    enabled: pano.enabled === true,
+    hasImage: Boolean(src),
+    overlap: typeof pano.overlap === "number" ? pano.overlap : 0,
+    scale: typeof pano.scale === "number" ? pano.scale : 100,
+    offsetY: typeof pano.offsetY === "number" ? pano.offsetY : 0,
+    src: src.startsWith("data:") ? "data-url" : src
+  };
+}
+function summarizeScreenshot(shot, index, lang = "en", panoramaActive = false) {
   const text = shot.text || {};
   const headlines = text.headlines || {};
   const subheadlines = text.subheadlines || {};
   const langs = Object.keys(shot.localizedImages || {});
+  const background = shot.background || {};
+  const type = typeof background.type === "string" ? background.type : "gradient";
+  const imageSrc = typeof background.imageSrc === "string" ? background.imageSrc : typeof background.image === "string" ? background.image : "";
   return {
     index,
     name: shot.name,
     deviceType: shot.deviceType || null,
     languages: langs,
-    hasImage: langs.some((lang) => Boolean(shot.localizedImages[lang]?.src)) || Boolean(shot.src),
+    hasImage: langs.some((code) => Boolean(shot.localizedImages[code]?.src)) || Boolean(shot.src),
     background: shot.background,
+    backgroundState: {
+      type,
+      hasImage: Boolean(imageSrc),
+      effective: panoramaActive ? "panorama" : type
+    },
     screenshot: shot.screenshot,
     headlines,
     subheadlines,
+    headlineEnabled: text.headlineEnabled !== false,
+    subheadlineEnabled: text.subheadlineEnabled === true,
     headlineFont: text.headlineFont,
     subheadlineFont: text.subheadlineFont,
+    headlineWeight: text.headlineWeight ?? null,
+    subheadlineWeight: text.subheadlineWeight ?? null,
+    headlineSize: numberSetting(text.headlineSize),
+    subheadlineSize: numberSetting(text.subheadlineSize),
+    effectiveHeadlineSize: effectiveLayoutNumber(text, "headlineSize", lang),
+    effectiveSubheadlineSize: effectiveLayoutNumber(text, "subheadlineSize", lang),
+    headlineTextWrap: text.headlineTextWrap || "wrap",
+    subheadlineTextWrap: text.subheadlineTextWrap || "wrap",
     headlineColor: text.headlineColor,
     subheadlineColor: text.subheadlineColor,
     position: text.position
   };
+}
+function renderSourceKeys(dump) {
+  const project = primaryProject(dump);
+  const panorama = summarizePanorama(project);
+  const active = panorama.enabled === true && panorama.hasImage === true;
+  const lang = project.currentLanguage || "en";
+  return project.screenshots.map((shot) => ({
+    image: screenshotImageRef(shot, lang),
+    panorama: active
+  }));
 }
 function redactDataUrls(value) {
   if (typeof value === "string") return value.startsWith("data:image/") ? "data-url" : value;
@@ -21498,6 +21572,9 @@ function redactDataUrls(value) {
 }
 function backupSummary(dump) {
   const project = primaryProject(dump);
+  const panorama = summarizePanorama(project);
+  const panoramaActive = panorama.enabled === true && panorama.hasImage === true;
+  const lang = project.currentLanguage || "en";
   return redactDataUrls({
     id: project.id,
     name: projectName(dump),
@@ -21507,8 +21584,9 @@ function backupSummary(dump) {
     projectLanguages: project.projectLanguages,
     selectedIndex: project.selectedIndex,
     screenshotCount: project.screenshots.length,
+    panoramicBackground: panorama,
     defaults: project.defaults,
-    screenshots: project.screenshots.map((shot, index) => summarizeScreenshot(shot, index))
+    screenshots: project.screenshots.map((shot, index) => summarizeScreenshot(shot, index, lang, panoramaActive))
   });
 }
 function bytesToBase64(bytes) {
@@ -21770,6 +21848,53 @@ async function inlineAssetRefs(kv, value, cache = /* @__PURE__ */ new Map()) {
   }
   return value;
 }
+function collectAssetHashes(value, out = /* @__PURE__ */ new Set()) {
+  if (typeof value === "string") {
+    const match = ASSET_REF.exec(value);
+    if (match) out.add(match[1]);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectAssetHashes(item, out);
+    return out;
+  }
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value)) collectAssetHashes(child, out);
+  }
+  return out;
+}
+function inlineLoadedAssets(value, assets) {
+  if (typeof value === "string") {
+    const match = ASSET_REF.exec(value);
+    if (!match) return value;
+    const blob = assets.get(match[1]);
+    if (!blob) {
+      throw new ProjectError("missing_asset", `Image asset ${match[1]} is missing. The render was not started.`);
+    }
+    return `data:${blob.mime};base64,${bytesToBase64(blob.bytes)}`;
+  }
+  if (Array.isArray(value)) return value.map((item) => inlineLoadedAssets(item, assets));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, child] of Object.entries(value)) out[key] = inlineLoadedAssets(child, assets);
+    return out;
+  }
+  return value;
+}
+async function buildRenderSupply(kv, backup) {
+  const assets = /* @__PURE__ */ new Map();
+  for (const hash of collectAssetHashes(backup)) {
+    const blob = await getBytes(kv, assetKey(hash));
+    if (!blob) {
+      throw new ProjectError("missing_asset", `Image asset ${hash} is missing. The render was not started.`);
+    }
+    assets.set(hash, { mime: blob.contentType, bytes: blob.bytes });
+  }
+  return {
+    projectBody: JSON.stringify(inlineLoadedAssets(backup, assets)),
+    assets
+  };
+}
 
 // src/schema.ts
 var GRADIENT_PRESET_CSS = [
@@ -21909,6 +22034,10 @@ function describeOptions() {
       subheadlineTextWrap: ["wrap", "balance"],
       note: "balance keeps the same line count as wrap and narrows the measure so the lines are closer in length."
     },
+    textEnabled: {
+      headlineEnabled: "Defaults to true. Setting headline or headlines through MCP turns it on. Pass headlineEnabled false in the same call to keep the text stored but hidden.",
+      subheadlineEnabled: "Defaults to false, so a subheadline stored on the screenshot is not drawn until this is true. Setting subheadline or subheadlines through MCP turns it on. Pass subheadlineEnabled false in the same call to keep the text stored but hidden."
+    },
     devices3D: ["iphone", "samsung"],
     frameColor3D: FRAME_COLORS_3D,
     shadowFields: ["enabled", "color", "blur", "opacity", "x", "y"],
@@ -22005,6 +22134,9 @@ var ProjectGate = class {
       const doc = await storage.get("doc");
       return Response.json({ version, doc: typeof doc === "string" ? doc : null });
     }
+    if (body.op === "acquire" || body.op === "release") {
+      return lockOp(storage, body);
+    }
     const run = async (txn) => {
       if (body.op === "delete") {
         await txn.delete("doc");
@@ -22035,6 +22167,40 @@ var ProjectGate = class {
     return run(storage);
   }
 };
+function lockKey(name) {
+  const safe = name && /^[a-z0-9_-]{1,32}$/i.test(name) ? name : "render";
+  return `lock:${safe}`;
+}
+async function readLock(storage, key) {
+  const raw = await storage.get(key);
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.token !== "string" || typeof parsed.until !== "number") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+async function lockOp(storage, body) {
+  const key = lockKey(body.lock);
+  const now = Date.now();
+  if (body.op === "release") {
+    const current2 = await readLock(storage, key);
+    if (current2 && current2.token === body.token) await storage.delete(key);
+    return Response.json({ ok: true });
+  }
+  const token = body.token || "";
+  if (!token) return Response.json({ ok: false, error: "lock token is required" }, { status: 400 });
+  const current = await readLock(storage, key);
+  if (current && current.until > now && current.token !== token) {
+    return Response.json({ ok: false, retryMs: 100 });
+  }
+  const ttl = Number.isFinite(body.ttlMs) ? Math.min(Math.max(body.ttlMs || 0, 1e3), 3e5) : 18e4;
+  const until = now + ttl;
+  await storage.put(key, JSON.stringify({ token, until }));
+  return Response.json({ ok: true, until });
+}
 var MemoryStorage = class {
   #map = /* @__PURE__ */ new Map();
   async get(key) {
@@ -22185,6 +22351,24 @@ async function installProject(env, envelope, backup) {
   const version = await createProjectDoc(env, envelope.id, backup);
   await writeEnvelope(env.APPSCREEN_KV, envelope, backup, version, envelope.updatedAt);
 }
+var RENDER_LOCK_WAIT_MS = 18e4;
+async function withRenderLock(env, id, fn, wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
+  const token = crypto.randomUUID();
+  const deadline = Date.now() + RENDER_LOCK_WAIT_MS;
+  while (true) {
+    const acquired = await gateCall(env, id, { op: "acquire", lock: "render", token, ttlMs: RENDER_LOCK_WAIT_MS });
+    if (acquired.ok) break;
+    if (Date.now() > deadline) {
+      throw new ProjectError("render_busy", "Timed out waiting for another render of this project to finish. Retry render_preview or export_project.");
+    }
+    await wait(Math.min(Math.max(acquired.retryMs || 250, 50), 1e3));
+  }
+  try {
+    return await fn();
+  } finally {
+    await gateCall(env, id, { op: "release", lock: "render", token });
+  }
+}
 async function replaceProjectDoc(env, id, backup, updatedAt) {
   await externalizeValue(env.APPSCREEN_KV, backup);
   const doc = JSON.stringify(backup);
@@ -22240,6 +22424,254 @@ async function putPublicFile(kv, token, bytes, contentType) {
 }
 async function getPublicFile(kv, token) {
   return getBytes(kv, fileKey(token));
+}
+
+// src/render.ts
+var BROWSER_KEEP_ALIVE_MS = 18e4;
+var BROWSER_RETRY_DELAYS_MS = [2e3, 8e3];
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function isBrowserRateLimit(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b429\b/.test(message) || /rate limit/i.test(message);
+}
+function acquisitionWaitMs(value) {
+  if (value == null || !Number.isFinite(value) || value <= 0) return null;
+  if (value < 1e3) return Math.round(value * 1e3);
+  return Math.round(value);
+}
+function browserRateLimitError(cause, limits2) {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  const waitMs = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
+  const seconds = waitMs != null ? Math.max(1, Math.ceil(waitMs / 1e3)) : 60;
+  const daily = /daily|browser hours|duration quota/i.test(raw) ? " If the message is the free-plan daily browser-time cap, retry after that allowance resets." : "";
+  return new Error(
+    `Browser Rendering rate limit: ${raw}. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A free session is reused when one is still alive, and every screenshot in one call shares that browser.${daily}`
+  );
+}
+async function connectFreeSession(puppeteer2, endpoint) {
+  let sessions2 = [];
+  try {
+    sessions2 = await puppeteer2.sessions(endpoint);
+  } catch {
+    return null;
+  }
+  for (const session of sessions2) {
+    if (!session?.sessionId || session.connectionId) continue;
+    try {
+      return await puppeteer2.connect(endpoint, session.sessionId);
+    } catch {
+    }
+  }
+  return null;
+}
+async function readLimits(puppeteer2, endpoint) {
+  if (!puppeteer2.limits) return null;
+  try {
+    return await puppeteer2.limits(endpoint);
+  } catch {
+    return null;
+  }
+}
+function retryDelay(attempt, limits2) {
+  const indicated = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
+  if (indicated == null) return BROWSER_RETRY_DELAYS_MS[attempt] ?? 8e3;
+  return Math.min(Math.max(indicated, 250), 15e3);
+}
+async function acquireBrowser(puppeteer2, endpoint, wait = sleep) {
+  const existing = await connectFreeSession(puppeteer2, endpoint);
+  if (existing) return existing;
+  let lastError;
+  let lastLimits = null;
+  const attempts = BROWSER_RETRY_DELAYS_MS.length + 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await puppeteer2.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
+    } catch (error) {
+      lastError = error;
+      if (!isBrowserRateLimit(error)) throw error;
+      lastLimits = await readLimits(puppeteer2, endpoint);
+      if (attempt === attempts - 1) throw browserRateLimitError(error, lastLimits);
+      await wait(retryDelay(attempt, lastLimits));
+      const freed = await connectFreeSession(puppeteer2, endpoint);
+      if (freed) return freed;
+    }
+  }
+  throw browserRateLimitError(lastError, lastLimits);
+}
+async function releaseBrowser(browser, discard = false) {
+  if (discard && typeof browser.close === "function") {
+    await browser.close();
+    return;
+  }
+  if (typeof browser.disconnect === "function") {
+    await browser.disconnect();
+    return;
+  }
+  if (typeof browser.close === "function") await browser.close();
+}
+function fulfillRenderRequest(rawUrl, supply) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return { kind: "continue" };
+  }
+  if (/\/api\/projects\/[^/]+$/.test(url.pathname)) {
+    return {
+      kind: "respond",
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: supply.projectBody,
+      headers: { "cache-control": "no-store" }
+    };
+  }
+  const asset = url.pathname.match(/\/assets\/([a-f0-9]{64})$/i);
+  if (!asset) return { kind: "continue" };
+  const blob = supply.assets.get(asset[1].toLowerCase());
+  if (!blob) return { kind: "missing", url: rawUrl };
+  return {
+    kind: "respond",
+    status: 200,
+    contentType: blob.mime,
+    body: blob.bytes,
+    headers: { "cache-control": "no-store" }
+  };
+}
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function assertRenderedFrames(shots, sources) {
+  if (shots.length < 2) return;
+  const hashes = await Promise.all(shots.map((shot) => sha256Hex(shot.png)));
+  const allSame = hashes.every((hash) => hash === hashes[0]);
+  const distinctImages = new Set(sources.map((source2) => source2.image).filter(Boolean));
+  const panorama = sources.some((source2) => source2.panorama);
+  if (allSame && (panorama || distinctImages.size > 1)) {
+    throw new Error(
+      `All ${shots.length} rendered PNGs are byte-identical. The device screenshot or panoramic background did not load before capture.`
+    );
+  }
+  const byHash = /* @__PURE__ */ new Map();
+  hashes.forEach((hash, i) => {
+    const image = sources[i]?.image || "";
+    if (!image) return;
+    const set = byHash.get(hash) || /* @__PURE__ */ new Set();
+    set.add(image);
+    byHash.set(hash, set);
+  });
+  for (const [, images] of byHash) {
+    if (images.size > 1) {
+      throw new Error(
+        `Screenshots that use different images (${[...images].join(", ")}) rendered to the same PNG. Capture ran before those images loaded.`
+      );
+    }
+  }
+}
+function respondBody(body) {
+  if (typeof body === "string") return body;
+  return Buffer.from(body);
+}
+async function installSupply(page, supply) {
+  if (!page.setRequestInterception || !page.on) {
+    throw new Error("This browser cannot intercept asset requests, so render would loop back to /assets and can capture a broken frame.");
+  }
+  let interceptError = "";
+  await page.setRequestInterception(true);
+  page.on("request", async (request) => {
+    try {
+      const decision = fulfillRenderRequest(request.url(), supply);
+      if (decision.kind === "continue") {
+        await request.continue();
+        return;
+      }
+      if (decision.kind === "missing") {
+        interceptError = `Render asset failed to load: ${decision.url}`;
+        await request.respond({ status: 404, contentType: "text/plain", body: interceptError, headers: { "cache-control": "no-store" } });
+        return;
+      }
+      await request.respond({
+        status: decision.status,
+        contentType: decision.contentType,
+        headers: decision.headers,
+        body: respondBody(decision.body)
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      interceptError = interceptError || `Render request failed for ${request.url()}: ${message}`;
+      try {
+        await request.abort?.("failed");
+      } catch {
+      }
+    }
+  });
+  return () => interceptError;
+}
+async function renderScreenshots(env, pageUrl, indices, hooks) {
+  if (!env.BROWSER && !hooks?.puppeteer) {
+    throw new Error("Browser Rendering binding BROWSER is not configured.");
+  }
+  const puppeteer2 = hooks?.puppeteer ?? (await Promise.resolve().then(() => (init_puppeteer_cloudflare(), puppeteer_cloudflare_exports))).default;
+  const browser = await acquireBrowser(puppeteer2, env.BROWSER, hooks?.sleep);
+  let page;
+  let discard = false;
+  try {
+    page = await browser.newPage();
+    await page.setViewport({ width: 900, height: 900, deviceScaleFactor: 1 });
+    if (page.setCacheEnabled) await page.setCacheEnabled(false);
+    const interceptionError = hooks?.supply ? await installSupply(page, hooks.supply) : null;
+    const opened = new URL(pageUrl);
+    opened.searchParams.set("cb", String(Date.now()));
+    await page.goto(opened.toString(), { waitUntil: "networkidle0", timeout: 9e4 });
+    if (interceptionError) {
+      const missed = interceptionError();
+      if (missed) throw new Error(missed);
+    }
+    await page.waitForFunction(
+      () => {
+        const status2 = document.documentElement.dataset.appscreenStatus;
+        return status2 === "ready" || status2 === "error";
+      },
+      { timeout: 9e4 }
+    );
+    const status = await page.evaluate(() => ({
+      status: document.documentElement.dataset.appscreenStatus || "",
+      error: document.documentElement.dataset.appscreenError || window.__appscreenError || ""
+    }));
+    if (interceptionError) {
+      const missed = interceptionError();
+      if (missed) throw new Error(missed);
+    }
+    if (status.status === "error") {
+      throw new Error(status.error || "Headless render failed in the Pages app.");
+    }
+    const shots = await page.evaluate(async (wanted) => {
+      const hook = window.__appscreen;
+      if (!hook) throw new Error("window.__appscreen is missing.");
+      const out = [];
+      for (const index of wanted) out.push(await hook.capture(index));
+      return out;
+    }, indices);
+    return shots.map((shot) => {
+      const match = /^data:image\/png;base64,(.+)$/i.exec(shot.dataUrl || "");
+      if (!match) throw new Error(`Screenshot ${shot.index} did not return a PNG data URL.`);
+      const binary = atob(match[1]);
+      const png = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) png[i] = binary.charCodeAt(i);
+      return { index: shot.index, png, width: shot.width, height: shot.height };
+    });
+  } catch (error) {
+    discard = true;
+    throw error;
+  } finally {
+    if (page?.close) {
+      try {
+        await page.close();
+      } catch {
+      }
+    }
+    await releaseBrowser(browser, discard);
+  }
 }
 
 // src/zip.ts
@@ -22830,7 +23262,7 @@ async function callTool(services, name, args) {
       if (!Number.isInteger(index) || index < 0 || index >= project.screenshots.length) {
         throw new ProjectError("invalid_index", `Screenshot index ${index} is out of range.`);
       }
-      const shots = await renderProject(services, envelope, [index]);
+      const shots = await renderProject(services, envelope, backup, [index]);
       const shot = shots[0];
       const url = await storeRendered(services, envelope.id, shot.png, "image/png", `screenshot-${index + 1}.png`);
       const data = {
@@ -22858,7 +23290,7 @@ async function callTool(services, name, args) {
         throw new ProjectError("empty_project", "Project has no screenshots to export.");
       }
       const indexes = project.screenshots.map((_, i) => i);
-      const shots = await renderProject(services, envelope, indexes);
+      const shots = await renderProject(services, envelope, backup, indexes);
       const pngs = [];
       const zipEntries = [];
       for (const shot of shots) {
@@ -22891,14 +23323,21 @@ async function callTool(services, name, args) {
       throw new ProjectError("unknown_tool", `Unknown tool "${name}".`);
   }
 }
-async function renderProject(services, envelope, indexes) {
+async function renderProject(services, envelope, backup, indexes) {
   if (!services.renderScreenshots) {
     throw new ProjectError("render_unavailable", "Browser rendering is not configured.");
   }
   const url = renderUrl(services, envelope.id, envelope.editKey, indexes.length === 1 ? String(indexes[0]) : "all");
   try {
-    return await services.renderScreenshots(url, indexes);
+    return await withRenderLock(services.env, envelope.id, async () => {
+      const supply = await buildRenderSupply(services.env.APPSCREEN_KV, backup);
+      const shots = await services.renderScreenshots(url, indexes, supply);
+      const sources = renderSourceKeys(backup);
+      await assertRenderedFrames(shots, indexes.map((index) => sources[index] || { image: "", panorama: false }));
+      return shots;
+    });
   } catch (error) {
+    if (error instanceof ProjectError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new ProjectError("render_failed", message);
   }
@@ -23154,7 +23593,8 @@ async function getProject(request, env, id) {
   }
   const loaded = await readProjectDoc(env, id);
   if (!loaded) return json({ error: "not_found" }, 404);
-  return json(presentAssetRefs(loaded.backup, publicOrigin(request, env)));
+  const headers = new Headers({ "cache-control": "no-store" });
+  return json(presentAssetRefs(loaded.backup, publicOrigin(request, env)), 200, headers);
 }
 async function putProject(request, env, id) {
   const envelope = await getEnvelope(env.APPSCREEN_KV, id);
@@ -23214,140 +23654,10 @@ async function putProject(request, env, id) {
   }
 }
 
-// src/render.ts
-var BROWSER_KEEP_ALIVE_MS = 18e4;
-var BROWSER_RETRY_DELAYS_MS = [2e3, 8e3];
-var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-function isBrowserRateLimit(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /\b429\b/.test(message) || /rate limit/i.test(message);
-}
-function acquisitionWaitMs(value) {
-  if (value == null || !Number.isFinite(value) || value <= 0) return null;
-  if (value < 1e3) return Math.round(value * 1e3);
-  return Math.round(value);
-}
-function browserRateLimitError(cause, limits2) {
-  const raw = cause instanceof Error ? cause.message : String(cause);
-  const waitMs = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
-  const seconds = waitMs != null ? Math.max(1, Math.ceil(waitMs / 1e3)) : 60;
-  const daily = /daily|browser hours|duration quota/i.test(raw) ? " If the message is the free-plan daily browser-time cap, retry after that allowance resets." : "";
-  return new Error(
-    `Browser Rendering rate limit: ${raw}. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A free session is reused when one is still alive, and every screenshot in one call shares that browser.${daily}`
-  );
-}
-async function connectFreeSession(puppeteer2, endpoint) {
-  let sessions2 = [];
-  try {
-    sessions2 = await puppeteer2.sessions(endpoint);
-  } catch {
-    return null;
-  }
-  for (const session of sessions2) {
-    if (!session?.sessionId || session.connectionId) continue;
-    try {
-      return await puppeteer2.connect(endpoint, session.sessionId);
-    } catch {
-    }
-  }
-  return null;
-}
-async function readLimits(puppeteer2, endpoint) {
-  if (!puppeteer2.limits) return null;
-  try {
-    return await puppeteer2.limits(endpoint);
-  } catch {
-    return null;
-  }
-}
-function retryDelay(attempt, limits2) {
-  const indicated = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
-  if (indicated == null) return BROWSER_RETRY_DELAYS_MS[attempt] ?? 8e3;
-  return Math.min(Math.max(indicated, 250), 15e3);
-}
-async function acquireBrowser(puppeteer2, endpoint, wait = sleep) {
-  const existing = await connectFreeSession(puppeteer2, endpoint);
-  if (existing) return existing;
-  let lastError;
-  let lastLimits = null;
-  const attempts = BROWSER_RETRY_DELAYS_MS.length + 1;
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    try {
-      return await puppeteer2.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
-    } catch (error) {
-      lastError = error;
-      if (!isBrowserRateLimit(error)) throw error;
-      lastLimits = await readLimits(puppeteer2, endpoint);
-      if (attempt === attempts - 1) throw browserRateLimitError(error, lastLimits);
-      await wait(retryDelay(attempt, lastLimits));
-      const freed = await connectFreeSession(puppeteer2, endpoint);
-      if (freed) return freed;
-    }
-  }
-  throw browserRateLimitError(lastError, lastLimits);
-}
-async function releaseBrowser(browser) {
-  if (typeof browser.disconnect === "function") {
-    await browser.disconnect();
-    return;
-  }
-  if (typeof browser.close === "function") await browser.close();
-}
-async function renderScreenshots(env, pageUrl, indices, hooks) {
-  if (!env.BROWSER && !hooks?.puppeteer) {
-    throw new Error("Browser Rendering binding BROWSER is not configured.");
-  }
-  const puppeteer2 = hooks?.puppeteer ?? (await Promise.resolve().then(() => (init_puppeteer_cloudflare(), puppeteer_cloudflare_exports))).default;
-  const browser = await acquireBrowser(puppeteer2, env.BROWSER, hooks?.sleep);
-  let page;
-  try {
-    page = await browser.newPage();
-    await page.setViewport({ width: 900, height: 900, deviceScaleFactor: 1 });
-    await page.goto(pageUrl, { waitUntil: "networkidle0", timeout: 9e4 });
-    await page.waitForFunction(
-      () => {
-        const status2 = document.documentElement.dataset.appscreenStatus;
-        return status2 === "ready" || status2 === "error";
-      },
-      { timeout: 9e4 }
-    );
-    const status = await page.evaluate(() => ({
-      status: document.documentElement.dataset.appscreenStatus || "",
-      error: document.documentElement.dataset.appscreenError || window.__appscreenError || ""
-    }));
-    if (status.status === "error") {
-      throw new Error(status.error || "Headless render failed in the Pages app.");
-    }
-    const shots = await page.evaluate(async (wanted) => {
-      const hook = window.__appscreen;
-      if (!hook) throw new Error("window.__appscreen is missing.");
-      const out = [];
-      for (const index of wanted) out.push(await hook.capture(index));
-      return out;
-    }, indices);
-    return shots.map((shot) => {
-      const match = /^data:image\/png;base64,(.+)$/i.exec(shot.dataUrl || "");
-      if (!match) throw new Error(`Screenshot ${shot.index} did not return a PNG data URL.`);
-      const binary = atob(match[1]);
-      const png = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) png[i] = binary.charCodeAt(i);
-      return { index: shot.index, png, width: shot.width, height: shot.height };
-    });
-  } finally {
-    if (page?.close) {
-      try {
-        await page.close();
-      } catch {
-      }
-    }
-    await releaseBrowser(browser);
-  }
-}
-
 // src/index.ts
 var index_default = {
   async fetch(request, env) {
-    return route(request, env, (pageUrl, indices) => renderScreenshots(env, pageUrl, indices));
+    return route(request, env, (pageUrl, indices, supply) => renderScreenshots(env, pageUrl, indices, { supply }));
   }
 };
 export {

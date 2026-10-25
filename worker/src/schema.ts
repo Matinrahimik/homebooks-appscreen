@@ -146,6 +146,12 @@ export function describeOptions(): Record<string, unknown> {
       subheadlineTextWrap: ["wrap", "balance"],
       note: "balance keeps the same line count as wrap and narrows the measure so the lines are closer in length.",
     },
+    textEnabled: {
+      headlineEnabled:
+        "Defaults to true. Setting headline or headlines through MCP turns it on. Pass headlineEnabled false in the same call to keep the text stored but hidden.",
+      subheadlineEnabled:
+        "Defaults to false, so a subheadline stored on the screenshot is not drawn until this is true. Setting subheadline or subheadlines through MCP turns it on. Pass subheadlineEnabled false in the same call to keep the text stored but hidden.",
+    },
     devices3D: ["iphone", "samsung"],
     frameColor3D: FRAME_COLORS_3D,
     shadowFields: ["enabled", "color", "blur", "opacity", "x", "y"],
