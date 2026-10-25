@@ -59,7 +59,15 @@ Bindings in that metadata:
 - `PAGES_PATH` — `/homebooks-appscreen/`
 - `PROJECT_GATE` — `durable_object_namespace`, class `ProjectGate`
 
-The first upload also sends a migration (`tag` `v1-project-gate`, `new_sqlite_classes`: `ProjectGate`). SQLite-backed Durable Objects are required for a new class. Do not add a second migration with the same tag.
+`v1-project-gate` (`new_sqlite_classes`: `ProjectGate`) is already applied on the production script. Later uploads of this metadata omit `migrations`. Sending it again, or sending Wrangler's `[[migrations]]` array, is rejected: the script-upload API expects an object (`cannot unmarshal array into ... ActorMigrations`), and an already-applied tag cannot be reused.
+
+The upload shape, when a migration is actually new, is an object:
+
+```json
+"migrations": { "old_tag": "v1-project-gate", "new_tag": "v2-example", "new_sqlite_classes": ["Example"] }
+```
+
+The first tag on a script has no `old_tag`: `{ "new_tag": "v1-project-gate", "new_sqlite_classes": ["ProjectGate"] }`. `worker/wrangler.toml` still has `[[migrations]]` because Wrangler converts that array itself. Do not copy the array into `metadata.json`.
 
 Compatibility date `2026-10-25`, flag `nodejs_compat`.
 
@@ -97,7 +105,9 @@ CORS allows `https://matinrahimik.github.io` and `http://localhost` / `http://12
 | `GET` | `/f/:token/:filename` | none (unguessable token) | PNG or ZIP bytes |
 | `POST` | `/mcp` | MCP bearer | JSON-RPC |
 
-`GET /api/projects/:id` returns the backup JSON with image fields rewritten to `https://<worker>/assets/<sha256>` so the editor does not download or upload the pixels on a settings change. `PUT` accepts those URLs, `asset:<sha256>` refs, or a self-contained backup whose images are still data URLs. `get_project` with `include_backup: true` returns the original self-contained Export/Import backup.
+`GET /api/projects/:id` returns the backup JSON with image fields rewritten to `https://<worker>/assets/<sha256>` so the editor does not download or upload the pixels on a settings change. The response is `cache-control: no-store`. `PUT` accepts those URLs, `asset:<sha256>` refs, or a self-contained backup whose images are still data URLs. `get_project` with `include_backup: true` returns the original self-contained Export/Import backup.
+
+`render_preview` and `export_project` do not ask Browser Rendering to fetch those asset URLs. The Worker reads the blobs from KV, inlines them into the backup, and fulfills the page's project and `/assets` requests from that memory. One render runs at a time per project. A render that fails closes the browser session instead of leaving it for the next call.
 
 The on-disk shape the app exports is still:
 

@@ -158,6 +158,29 @@ describe("mcp tools", () => {
     assert.equal((pano.panoramicBackground as { enabled: boolean }).enabled, true);
     assert.equal((pano.panoramicBackground as { overlap: number }).overlap, 0.25);
 
+    const viewed = toolData(await rpc(e, "tools/call", { name: "get_project", arguments: { project_id: id } }));
+    const viewedSummary = viewed.summary as {
+      panoramicBackground: { enabled: boolean; hasImage: boolean; overlap: number; src: string };
+      screenshots: {
+        backgroundState: { type: string; effective: string; hasImage: boolean };
+        headlineSize: number;
+        headlineWeight: string;
+        subheadlineEnabled: boolean;
+        headlineTextWrap: string;
+        subheadlineTextWrap: string;
+      }[];
+    };
+    assert.equal(viewedSummary.panoramicBackground.enabled, true);
+    assert.equal(viewedSummary.panoramicBackground.hasImage, true);
+    assert.equal(viewedSummary.panoramicBackground.overlap, 0.25);
+    assert.match(viewedSummary.panoramicBackground.src, /^asset:[a-f0-9]{64}$/);
+    assert.equal(viewedSummary.screenshots[0].backgroundState.effective, "panorama");
+    assert.equal(viewedSummary.screenshots[0].headlineWeight, "700");
+    assert.equal(viewedSummary.screenshots[0].subheadlineEnabled, true);
+    assert.equal(viewedSummary.screenshots[0].headlineTextWrap, "wrap");
+    assert.equal(viewedSummary.screenshots[0].subheadlineTextWrap, "wrap");
+    assert.equal(typeof viewedSummary.screenshots[0].headlineSize, "number");
+
     const sized = toolData(await rpc(e, "tools/call", {
       name: "set_output_size",
       arguments: { project_id: id, device: "iphone-6.5" },
@@ -188,6 +211,7 @@ describe("mcp tools", () => {
       headers: { "X-Edit-Key": editKey },
     }), e);
     assert.equal(live.status, 200);
+    assert.equal(live.headers.get("cache-control"), "no-store");
     const backup = await live.json() as {
       projects: {
         panoramicBackground: { src: string; overlap: number };
@@ -246,6 +270,8 @@ describe("mcp tools", () => {
     assert.match(optionsText, /108%/);
     assert.match(optionsText, /languageSettings\.<lang>\.headlineSize/);
     assert.deepEqual((options.textWrap as { headlineTextWrap: string[] }).headlineTextWrap, ["wrap", "balance"]);
+    assert.match(String((options.textEnabled as { subheadlineEnabled: string }).subheadlineEnabled), /Defaults to false/);
+    assert.match(String((options.textEnabled as { headlineEnabled: string }).headlineEnabled), /Defaults to true/);
     const schema = toolData(await rpc(e, "tools/call", { name: "get_schema", arguments: {} }));
     const schemaText = JSON.stringify(schema);
     assert.match(schemaText, /108%/);
@@ -318,7 +344,32 @@ describe("mcp tools", () => {
     const gate = metadata.bindings.find((binding: { name: string }) => binding.name === "PROJECT_GATE");
     assert.equal(gate.type, "durable_object_namespace");
     assert.equal(gate.class_name, "ProjectGate");
-    assert.equal(metadata.migrations[0].tag, "v1-project-gate");
-    assert.deepEqual(metadata.migrations[0].new_sqlite_classes, ["ProjectGate"]);
+    assert.equal(metadata.migrations, undefined);
+  });
+
+  it("refuses an export whose captures are identical for different images", async () => {
+    const e = env();
+    const created = toolData(await rpc(e, "tools/call", { name: "create_project", arguments: { name: "HomeBooks" } }));
+    const id = String(created.project_id);
+    const first = Buffer.from([137, 80, 78, 71, 1]).toString("base64");
+    const second = Buffer.from([137, 80, 78, 71, 2]).toString("base64");
+    toolData(await rpc(e, "tools/call", { name: "add_screenshot", arguments: { project_id: id, image_base64: first, name: "one.png" } }));
+    toolData(await rpc(e, "tools/call", { name: "add_screenshot", arguments: { project_id: id, image_base64: second, name: "two.png" } }));
+    let supplied = "";
+    const response = await route(mcp({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "export_project", arguments: { project_id: id } },
+    }), e, async (_url, indices, supply) => {
+      supplied = supply?.projectBody || "";
+      const png = new Uint8Array([137, 80, 78, 71, 9]);
+      return indices.map((index) => ({ index, png, width: 10, height: 10 }));
+    });
+    const json = await response.json() as { result?: { isError?: boolean; content?: { text?: string }[] } };
+    assert.equal(json.result?.isError, true);
+    assert.match(json.result?.content?.[0].text || "", /byte-identical/);
+    assert.match(supplied, /data:image\/png;base64,/);
+    assert.equal(supplied.includes("/assets/"), false);
   });
 });

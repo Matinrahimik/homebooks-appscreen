@@ -36,6 +36,14 @@ export interface Services {
   now?: () => string;
   /** Fetch a remote screenshot image. Overridable in tests. */
   loadImage?: (url: string) => Promise<{ mime: string; bytes: Uint8Array }>;
-  /** Headless render. Omitted in unit tests that do not exercise rendering. */
-  renderScreenshots?: (pageUrl: string, indices: number[]) => Promise<RenderShot[]>;
+  /**
+   * Headless render. `supply` is the inlined backup and asset bytes. The browser
+   * answers /api/projects and /assets from it instead of looping back to this Worker.
+   * Omitted in unit tests that do not exercise rendering.
+   */
+  renderScreenshots?: (
+    pageUrl: string,
+    indices: number[],
+    supply?: { projectBody: string; assets: Map<string, { mime: string; bytes: Uint8Array }> },
+  ) => Promise<RenderShot[]>;
 }

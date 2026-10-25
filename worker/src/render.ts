@@ -1,3 +1,4 @@
+import type { RenderSupply } from "./assets.ts";
 import type { RenderShot } from "./types.ts";
 
 interface BrowserEnv {
@@ -14,8 +15,23 @@ export interface BrowserLimits {
   timeUntilNextAllowedBrowserAcquisition?: number;
 }
 
+interface InterceptedRequest {
+  url(): string;
+  continue(): Promise<void>;
+  respond(response: {
+    status: number;
+    contentType?: string;
+    headers?: Record<string, string>;
+    body?: string | Uint8Array | Buffer;
+  }): Promise<void>;
+  abort?(reason?: string): Promise<void>;
+}
+
 interface BrowserPage {
   setViewport(viewport: { width: number; height: number; deviceScaleFactor: number }): Promise<unknown>;
+  setCacheEnabled?(enabled: boolean): Promise<void>;
+  setRequestInterception?(value: boolean): Promise<void>;
+  on?(event: "request", handler: (request: InterceptedRequest) => void | Promise<void>): void;
   goto(url: string, options: { waitUntil: string; timeout: number }): Promise<unknown>;
   waitForFunction(fn: () => boolean, options: { timeout: number }): Promise<unknown>;
   evaluate<T>(fn: (...args: never[]) => T, arg?: unknown): Promise<T>;
@@ -136,7 +152,11 @@ export async function acquireBrowser(
   throw browserRateLimitError(lastError, lastLimits);
 }
 
-export async function releaseBrowser(browser: BrowserHandle): Promise<void> {
+export async function releaseBrowser(browser: BrowserHandle, discard = false): Promise<void> {
+  if (discard && typeof browser.close === "function") {
+    await browser.close();
+    return;
+  }
   if (typeof browser.disconnect === "function") {
     await browser.disconnect();
     return;
@@ -144,15 +164,145 @@ export async function releaseBrowser(browser: BrowserHandle): Promise<void> {
   if (typeof browser.close === "function") await browser.close();
 }
 
+export type FulfillDecision =
+  | { kind: "continue" }
+  | { kind: "missing"; url: string }
+  | { kind: "respond"; status: number; contentType: string; body: Uint8Array | string; headers: Record<string, string> };
+
+/** Answer the render page's project and asset fetches from memory. Everything else uses the network. */
+export function fulfillRenderRequest(rawUrl: string, supply: RenderSupply): FulfillDecision {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return { kind: "continue" };
+  }
+  if (/\/api\/projects\/[^/]+$/.test(url.pathname)) {
+    return {
+      kind: "respond",
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: supply.projectBody,
+      headers: { "cache-control": "no-store" },
+    };
+  }
+  const asset = url.pathname.match(/\/assets\/([a-f0-9]{64})$/i);
+  if (!asset) return { kind: "continue" };
+  const blob = supply.assets.get(asset[1].toLowerCase());
+  if (!blob) return { kind: "missing", url: rawUrl };
+  return {
+    kind: "respond",
+    status: 200,
+    contentType: blob.mime,
+    body: blob.bytes,
+    headers: { "cache-control": "no-store" },
+  };
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export interface CaptureSource {
+  image: string;
+  panorama: boolean;
+}
+
+/**
+ * Identical PNGs are the export failure mode: every index captured the gradient
+ * before its photo or panorama decoded. Matching frames are allowed when they
+ * really share one image and there is no panorama to slice.
+ */
+export async function assertRenderedFrames(
+  shots: { index: number; png: Uint8Array }[],
+  sources: CaptureSource[],
+): Promise<void> {
+  if (shots.length < 2) return;
+  const hashes = await Promise.all(shots.map((shot) => sha256Hex(shot.png)));
+  const allSame = hashes.every((hash) => hash === hashes[0]);
+  const distinctImages = new Set(sources.map((source) => source.image).filter(Boolean));
+  const panorama = sources.some((source) => source.panorama);
+  if (allSame && (panorama || distinctImages.size > 1)) {
+    throw new Error(
+      `All ${shots.length} rendered PNGs are byte-identical. The device screenshot or panoramic background did not load before capture.`,
+    );
+  }
+  const byHash = new Map<string, Set<string>>();
+  hashes.forEach((hash, i) => {
+    const image = sources[i]?.image || "";
+    if (!image) return;
+    const set = byHash.get(hash) || new Set<string>();
+    set.add(image);
+    byHash.set(hash, set);
+  });
+  for (const [, images] of byHash) {
+    if (images.size > 1) {
+      throw new Error(
+        `Screenshots that use different images (${[...images].join(", ")}) rendered to the same PNG. Capture ran before those images loaded.`,
+      );
+    }
+  }
+}
+
 interface RenderHooks {
   puppeteer?: PuppeteerBinding;
   sleep?: (ms: number) => Promise<void>;
+  /** When set, project JSON and /assets are answered from KV bytes. No loopback. */
+  supply?: RenderSupply;
 }
 
 /**
  * Open the hosted Pages app in render mode and read each finished canvas
  * at its real output pixel size via window.__appscreen.capture().
  * Every index is captured in the same browser session.
+ */
+function respondBody(body: Uint8Array | string): string | Buffer {
+  if (typeof body === "string") return body;
+  return Buffer.from(body);
+}
+
+async function installSupply(page: BrowserPage, supply: RenderSupply): Promise<() => string> {
+  if (!page.setRequestInterception || !page.on) {
+    throw new Error("This browser cannot intercept asset requests, so render would loop back to /assets and can capture a broken frame.");
+  }
+  let interceptError = "";
+  await page.setRequestInterception(true);
+  page.on("request", async (request) => {
+    try {
+      const decision = fulfillRenderRequest(request.url(), supply);
+      if (decision.kind === "continue") {
+        await request.continue();
+        return;
+      }
+      if (decision.kind === "missing") {
+        interceptError = `Render asset failed to load: ${decision.url}`;
+        await request.respond({ status: 404, contentType: "text/plain", body: interceptError, headers: { "cache-control": "no-store" } });
+        return;
+      }
+      await request.respond({
+        status: decision.status,
+        contentType: decision.contentType,
+        headers: decision.headers,
+        body: respondBody(decision.body),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      interceptError = interceptError || `Render request failed for ${request.url()}: ${message}`;
+      try {
+        await request.abort?.("failed");
+      } catch {
+        /* The page will see the failed asset and refuse to mark ready. */
+      }
+    }
+  });
+  return () => interceptError;
+}
+
+/**
+ * Open a fresh page in render mode and read each finished canvas at its real
+ * output pixel size. A failed render closes the browser so the next call does
+ * not reconnect to a session whose HTTP cache or IndexedDB is poisoned.
  */
 export async function renderScreenshots(
   env: BrowserEnv,
@@ -166,10 +316,19 @@ export async function renderScreenshots(
   const puppeteer = hooks?.puppeteer ?? ((await import("@cloudflare/puppeteer")).default as PuppeteerBinding);
   const browser = await acquireBrowser(puppeteer, env.BROWSER, hooks?.sleep);
   let page: BrowserPage | undefined;
+  let discard = false;
   try {
     page = await browser.newPage();
     await page.setViewport({ width: 900, height: 900, deviceScaleFactor: 1 });
-    await page.goto(pageUrl, { waitUntil: "networkidle0", timeout: 90_000 });
+    if (page.setCacheEnabled) await page.setCacheEnabled(false);
+    const interceptionError = hooks?.supply ? await installSupply(page, hooks.supply) : null;
+    const opened = new URL(pageUrl);
+    opened.searchParams.set("cb", String(Date.now()));
+    await page.goto(opened.toString(), { waitUntil: "networkidle0", timeout: 90_000 });
+    if (interceptionError) {
+      const missed = interceptionError();
+      if (missed) throw new Error(missed);
+    }
     await page.waitForFunction(
       () => {
         const status = document.documentElement.dataset.appscreenStatus;
@@ -181,6 +340,10 @@ export async function renderScreenshots(
       status: document.documentElement.dataset.appscreenStatus || "",
       error: document.documentElement.dataset.appscreenError || (window as unknown as { __appscreenError?: string }).__appscreenError || "",
     }));
+    if (interceptionError) {
+      const missed = interceptionError();
+      if (missed) throw new Error(missed);
+    }
     if (status.status === "error") {
       throw new Error(status.error || "Headless render failed in the Pages app.");
     }
@@ -203,14 +366,17 @@ export async function renderScreenshots(
       for (let i = 0; i < binary.length; i++) png[i] = binary.charCodeAt(i);
       return { index: shot.index, png, width: shot.width, height: shot.height };
     });
+  } catch (error) {
+    discard = true;
+    throw error;
   } finally {
     if (page?.close) {
       try {
         await page.close();
       } catch {
-        /* The session is still reusable after the page goes away. */
+        /* A discarded session is closed below. A healthy one stays reusable. */
       }
     }
-    await releaseBrowser(browser);
+    await releaseBrowser(browser, discard);
   }
 }

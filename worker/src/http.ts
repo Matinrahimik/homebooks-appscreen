@@ -150,7 +150,8 @@ async function getProject(request: Request, env: Env, id: string): Promise<Respo
   }
   const loaded = await readProjectDoc(env, id);
   if (!loaded) return json({ error: "not_found" }, 404);
-  return json(presentAssetRefs(loaded.backup, publicOrigin(request, env)));
+  const headers = new Headers({ "cache-control": "no-store" });
+  return json(presentAssetRefs(loaded.backup, publicOrigin(request, env)), 200, headers);
 }
 
 async function putProject(request: Request, env: Env, id: string): Promise<Response> {

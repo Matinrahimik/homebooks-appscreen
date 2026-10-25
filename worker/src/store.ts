@@ -26,8 +26,9 @@ export interface ProjectIndexEntry {
 
 interface GateResult {
   ok?: boolean;
-  version: number;
-  doc: string | null;
+  version?: number;
+  doc?: string | null;
+  retryMs?: number;
 }
 
 const INDEX_KEY = "idx:projects";
@@ -159,6 +160,36 @@ export async function createProjectDoc(env: Env, id: string, backup: BackupDump)
 export async function installProject(env: Env, envelope: ProjectEnvelope, backup: BackupDump): Promise<void> {
   const version = await createProjectDoc(env, envelope.id, backup);
   await writeEnvelope(env.APPSCREEN_KV, envelope, backup, version, envelope.updatedAt);
+}
+
+const RENDER_LOCK_WAIT_MS = 180_000;
+
+/**
+ * One render at a time per project. The Durable Object stores the lock, so two
+ * isolates cannot both open Browser Rendering for the same project. A crashed
+ * holder expires and the next caller takes the lock.
+ */
+export async function withRenderLock<T>(
+  env: Env,
+  id: string,
+  fn: () => Promise<T>,
+  wait: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<T> {
+  const token = crypto.randomUUID();
+  const deadline = Date.now() + RENDER_LOCK_WAIT_MS;
+  while (true) {
+    const acquired = await gateCall(env, id, { op: "acquire", lock: "render", token, ttlMs: RENDER_LOCK_WAIT_MS });
+    if (acquired.ok) break;
+    if (Date.now() > deadline) {
+      throw new ProjectError("render_busy", "Timed out waiting for another render of this project to finish. Retry render_preview or export_project.");
+    }
+    await wait(Math.min(Math.max(acquired.retryMs || 250, 50), 1000));
+  }
+  try {
+    return await fn();
+  } finally {
+    await gateCall(env, id, { op: "release", lock: "render", token });
+  }
 }
 
 /** Last-write-wins replace used by the live editor. Serialized by the project gate. */

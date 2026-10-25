@@ -27,11 +27,5 @@
       "name": "PROJECT_GATE",
       "class_name": "ProjectGate"
     }
-  ],
-  "migrations": [
-    {
-      "tag": "v1-project-gate",
-      "new_sqlite_classes": ["ProjectGate"]
-    }
   ]
 }

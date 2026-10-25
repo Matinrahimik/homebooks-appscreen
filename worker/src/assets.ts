@@ -236,3 +236,69 @@ export async function inlineAssetRefs(kv: KvLike, value: unknown, cache = new Ma
   }
   return value;
 }
+
+export interface RenderAsset {
+  mime: string;
+  bytes: Uint8Array;
+}
+
+/** Backup JSON with image bytes inlined, plus the raw blobs for request interception. */
+export interface RenderSupply {
+  projectBody: string;
+  assets: Map<string, RenderAsset>;
+}
+
+export function collectAssetHashes(value: unknown, out = new Set<string>()): Set<string> {
+  if (typeof value === "string") {
+    const match = ASSET_REF.exec(value);
+    if (match) out.add(match[1]);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectAssetHashes(item, out);
+    return out;
+  }
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value)) collectAssetHashes(child, out);
+  }
+  return out;
+}
+
+function inlineLoadedAssets(value: unknown, assets: Map<string, RenderAsset>): unknown {
+  if (typeof value === "string") {
+    const match = ASSET_REF.exec(value);
+    if (!match) return value;
+    const blob = assets.get(match[1]);
+    if (!blob) {
+      throw new ProjectError("missing_asset", `Image asset ${match[1]} is missing. The render was not started.`);
+    }
+    return `data:${blob.mime};base64,${bytesToBase64(blob.bytes)}`;
+  }
+  if (Array.isArray(value)) return value.map((item) => inlineLoadedAssets(item, assets));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) out[key] = inlineLoadedAssets(child, assets);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Read every asset the backup names. A missing blob fails here, before a browser
+ * is launched, naming the hash. The page receives data URLs so Browser Rendering
+ * does not loop back to this Worker's /assets route.
+ */
+export async function buildRenderSupply(kv: KvLike, backup: unknown): Promise<RenderSupply> {
+  const assets = new Map<string, RenderAsset>();
+  for (const hash of collectAssetHashes(backup)) {
+    const blob = await getBytes(kv, assetKey(hash));
+    if (!blob) {
+      throw new ProjectError("missing_asset", `Image asset ${hash} is missing. The render was not started.`);
+    }
+    assets.set(hash, { mime: blob.contentType, bytes: blob.bytes });
+  }
+  return {
+    projectBody: JSON.stringify(inlineLoadedAssets(backup, assets)),
+    assets,
+  };
+}

@@ -1,4 +1,4 @@
-import { assertPanoramaBytes, inlineAssetRefs, storeAsset } from "./assets.ts";
+import { assertPanoramaBytes, buildRenderSupply, inlineAssetRefs, storeAsset } from "./assets.ts";
 import { findGradientPreset, backupSchema, describeOptions } from "./schema.ts";
 import {
   addScreenshot,
@@ -11,6 +11,7 @@ import {
   primaryProject,
   ProjectError,
   projectName,
+  renderSourceKeys,
   removeScreenshot,
   reorderScreenshots,
   replaceScreenshot,
@@ -30,8 +31,10 @@ import {
   putPublicFile,
   readProjectDoc,
   rememberFile,
+  withRenderLock,
   type ProjectEnvelope,
 } from "./store.ts";
+import { assertRenderedFrames } from "./render.ts";
 import { zipStore } from "./zip.ts";
 import { KvLimitError } from "./kvblob.ts";
 import type { Services } from "./types.ts";
@@ -603,7 +606,7 @@ export async function callTool(services: Services, name: string, args: Record<st
       if (!Number.isInteger(index) || index < 0 || index >= project.screenshots.length) {
         throw new ProjectError("invalid_index", `Screenshot index ${index} is out of range.`);
       }
-      const shots = await renderProject(services, envelope, [index]);
+      const shots = await renderProject(services, envelope, backup, [index]);
       const shot = shots[0];
       const url = await storeRendered(services, envelope.id, shot.png, "image/png", `screenshot-${index + 1}.png`);
       const data: Record<string, unknown> = {
@@ -631,7 +634,7 @@ export async function callTool(services: Services, name: string, args: Record<st
         throw new ProjectError("empty_project", "Project has no screenshots to export.");
       }
       const indexes = project.screenshots.map((_, i) => i);
-      const shots = await renderProject(services, envelope, indexes);
+      const shots = await renderProject(services, envelope, backup, indexes);
       const pngs = [];
       const zipEntries = [];
       for (const shot of shots) {
@@ -665,14 +668,21 @@ export async function callTool(services: Services, name: string, args: Record<st
   }
 }
 
-async function renderProject(services: Services, envelope: ProjectEnvelope, indexes: number[]) {
+async function renderProject(services: Services, envelope: ProjectEnvelope, backup: BackupDump, indexes: number[]) {
   if (!services.renderScreenshots) {
     throw new ProjectError("render_unavailable", "Browser rendering is not configured.");
   }
   const url = renderUrl(services, envelope.id, envelope.editKey, indexes.length === 1 ? String(indexes[0]) : "all");
   try {
-    return await services.renderScreenshots(url, indexes);
+    return await withRenderLock(services.env, envelope.id, async () => {
+      const supply = await buildRenderSupply(services.env.APPSCREEN_KV, backup);
+      const shots = await services.renderScreenshots!(url, indexes, supply);
+      const sources = renderSourceKeys(backup);
+      await assertRenderedFrames(shots, indexes.map((index) => sources[index] || { image: "", panorama: false }));
+      return shots;
+    });
   } catch (error) {
+    if (error instanceof ProjectError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new ProjectError("render_failed", message);
   }

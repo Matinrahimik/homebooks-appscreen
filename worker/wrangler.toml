@@ -22,6 +22,8 @@ PAGES_PATH = "/homebooks-appscreen/"
 name = "PROJECT_GATE"
 class_name = "ProjectGate"
 
+# Wrangler converts this array. The script-upload API does not: metadata.json
+# omits migrations because v1-project-gate is already applied in production.
 [[migrations]]
 tag = "v1-project-gate"
 new_sqlite_classes = ["ProjectGate"]
