@@ -6,6 +6,6 @@ export { ProjectGate } from "./gate.ts";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    return route(request, env, (pageUrl, indices, supply) => renderScreenshots(env, pageUrl, indices, { supply }));
+    return route(request, env, (pageUrl, indices) => renderScreenshots(env, pageUrl, indices));
   },
 };

@@ -878,7 +878,7 @@ function mergeAll(concurrent) {
 function concatAll() {
   return mergeAll(1);
 }
-function concat() {
+function concat2() {
   var args = [];
   for (var _i = 0; _i < arguments.length; _i++) {
     args[_i] = arguments[_i];
@@ -1197,7 +1197,7 @@ function startWith() {
   }
   var scheduler = popScheduler(values);
   return operate(function(source2, subscriber) {
-    (scheduler ? concat(values, source2, scheduler) : concat(values, source2)).subscribe(subscriber);
+    (scheduler ? concat2(values, source2, scheduler) : concat2(values, source2)).subscribe(subscriber);
   });
 }
 function switchMap(project, resultSelector) {
@@ -5209,7 +5209,7 @@ var init_Page = __esm({
             "request"
             /* PageEvent.Request */
           ).pipe(mergeMap((originalRequest) => {
-            return concat(of(1), merge(fromEmitterEvent(
+            return concat2(of(1), merge(fromEmitterEvent(
               this,
               "requestfailed"
               /* PageEvent.RequestFailed */
@@ -20582,6 +20582,71 @@ async function putBytes(kv, key, bytes, contentType, maxBytes = MAX_OBJECT_BYTES
   await kv.put(metaKey(key), JSON.stringify(meta));
   for (let i = parts.length; i < previous; i++) await kv.delete(chunkKey(key, i));
 }
+async function readBlobMeta(kv, key) {
+  const raw = await kv.get(metaKey(key), { type: "text" });
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new KvLimitError(`Value "${key}" has invalid metadata.`);
+  }
+}
+function chainChunkStreams(count, open) {
+  let index = 0;
+  let reader = null;
+  return new ReadableStream({
+    async pull(controller) {
+      while (true) {
+        if (!reader) {
+          if (index >= count) {
+            controller.close();
+            return;
+          }
+          const opened = index;
+          const next = await open(index);
+          index += 1;
+          if (!next) {
+            controller.error(new Error(`Missing binary chunk ${opened}`));
+            return;
+          }
+          reader = next.getReader();
+        }
+        const { done, value } = await reader.read();
+        if (done) {
+          reader.releaseLock();
+          reader = null;
+          continue;
+        }
+        controller.enqueue(value);
+        return;
+      }
+    },
+    cancel(reason) {
+      return reader?.cancel(reason);
+    }
+  });
+}
+async function openByteStream(kv, key) {
+  const meta = await readBlobMeta(kv, key);
+  if (!meta) return null;
+  if (meta.encoding !== "bytes") {
+    throw new KvLimitError(`Value "${key}" is not stored as bytes.`);
+  }
+  const stream = chainChunkStreams(meta.chunks, async (i) => {
+    const part = await kv.get(chunkKey(key, i), { type: "stream" });
+    return part instanceof ReadableStream ? part : null;
+  });
+  return { stream, size: meta.size, contentType: meta.contentType || "application/octet-stream" };
+}
+async function putStreamedBytes(kv, key, body, size, contentType) {
+  assertObjectSize(size, `Binary value "${key}"`, KV_VALUE_LIMIT);
+  if (size <= 0) throw new KvLimitError(`Binary value "${key}" is empty.`);
+  const previous = await existingChunkCount(kv, key);
+  await kv.put(chunkKey(key, 0), body);
+  const meta = { chunks: 1, size, encoding: "bytes", contentType };
+  await kv.put(metaKey(key), JSON.stringify(meta));
+  for (let i = 1; i < previous; i++) await kv.delete(chunkKey(key, i));
+}
 async function getBytes(kv, key) {
   const raw = await kv.get(metaKey(key), { type: "text" });
   if (typeof raw !== "string" || !raw) return null;
@@ -21863,37 +21928,22 @@ function collectAssetHashes(value, out = /* @__PURE__ */ new Set()) {
   }
   return out;
 }
-function inlineLoadedAssets(value, assets) {
-  if (typeof value === "string") {
-    const match = ASSET_REF.exec(value);
-    if (!match) return value;
-    const blob = assets.get(match[1]);
-    if (!blob) {
-      throw new ProjectError("missing_asset", `Image asset ${match[1]} is missing. The render was not started.`);
-    }
-    return `data:${blob.mime};base64,${bytesToBase64(blob.bytes)}`;
-  }
-  if (Array.isArray(value)) return value.map((item) => inlineLoadedAssets(item, assets));
-  if (value && typeof value === "object") {
-    const out = {};
-    for (const [key, child] of Object.entries(value)) out[key] = inlineLoadedAssets(child, assets);
-    return out;
-  }
-  return value;
-}
-async function buildRenderSupply(kv, backup) {
-  const assets = /* @__PURE__ */ new Map();
+async function assertAssetsPresent(kv, backup) {
   for (const hash of collectAssetHashes(backup)) {
-    const blob = await getBytes(kv, assetKey(hash));
-    if (!blob) {
+    const raw = await kv.get(`${assetKey(hash)}:meta`, { type: "text" });
+    if (typeof raw !== "string" || !raw) {
       throw new ProjectError("missing_asset", `Image asset ${hash} is missing. The render was not started.`);
     }
-    assets.set(hash, { mime: blob.contentType, bytes: blob.bytes });
   }
-  return {
-    projectBody: JSON.stringify(inlineLoadedAssets(backup, assets)),
-    assets
-  };
+}
+
+// src/log.ts
+function logStage(stage, fields = {}) {
+  const payload = { stage };
+  for (const [key, value] of Object.entries(fields)) {
+    payload[key] = typeof value === "string" ? value.replace(/([?&](?:key|uploads|token)=)[^&\s]+/gi, "$1redacted") : value;
+  }
+  console.log(JSON.stringify(payload));
 }
 
 // src/schema.ts
@@ -22238,13 +22288,168 @@ function memoryProjectGate(kv) {
   };
 }
 
+// src/zip.ts
+var CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+function dosTime(date = /* @__PURE__ */ new Date()) {
+  const time = date.getHours() << 11 | date.getMinutes() << 5 | Math.floor(date.getSeconds() / 2);
+  const d = date.getFullYear() - 1980 << 9 | date.getMonth() + 1 << 5 | date.getDate();
+  return { time, date: d };
+}
+function nameBytes(name) {
+  return new TextEncoder().encode(name);
+}
+function zipLocalHeader(name, crc, size, time, date) {
+  const encoded = nameBytes(name);
+  const local = new Uint8Array(30 + encoded.length);
+  const view = new DataView(local.buffer);
+  view.setUint32(0, 67324752, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(8, 0, true);
+  view.setUint16(10, time, true);
+  view.setUint16(12, date, true);
+  view.setUint32(14, crc >>> 0, true);
+  view.setUint32(18, size, true);
+  view.setUint32(22, size, true);
+  view.setUint16(26, encoded.length, true);
+  local.set(encoded, 30);
+  return local;
+}
+function zipCentralHeader(name, crc, size, offset, time, date) {
+  const encoded = nameBytes(name);
+  const central = new Uint8Array(46 + encoded.length);
+  const view = new DataView(central.buffer);
+  view.setUint32(0, 33639248, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(6, 20, true);
+  view.setUint16(10, 0, true);
+  view.setUint16(12, time, true);
+  view.setUint16(14, date, true);
+  view.setUint32(16, crc >>> 0, true);
+  view.setUint32(20, size, true);
+  view.setUint32(24, size, true);
+  view.setUint16(28, encoded.length, true);
+  view.setUint32(42, offset, true);
+  central.set(encoded, 46);
+  return central;
+}
+function zipEndOfCentral(count, centralSize, centralOffset) {
+  const end = new Uint8Array(22);
+  const view = new DataView(end.buffer);
+  view.setUint32(0, 101010256, true);
+  view.setUint16(8, count, true);
+  view.setUint16(10, count, true);
+  view.setUint32(12, centralSize, true);
+  view.setUint32(16, centralOffset, true);
+  return end;
+}
+function concat(parts) {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const out = new Uint8Array(total);
+  let cursor = 0;
+  for (const part of parts) {
+    out.set(part, cursor);
+    cursor += part.byteLength;
+  }
+  return out;
+}
+function storeZipByteLength(files) {
+  const encoder = new TextEncoder();
+  let total = 22;
+  for (const file of files) total += 30 + encoder.encode(file.name).length + file.size + 46 + encoder.encode(file.name).length;
+  return total;
+}
+function storeZipStream(files, open, when = /* @__PURE__ */ new Date()) {
+  const { time, date } = dosTime(when);
+  const locals = files.map((file) => zipLocalHeader(file.name, file.crc, file.size, time, date));
+  let offset = 0;
+  const centrals = files.map((file, index2) => {
+    const header = zipCentralHeader(file.name, file.crc, file.size, offset, time, date);
+    offset += locals[index2].byteLength + file.size;
+    return header;
+  });
+  const central = concat(centrals);
+  const end = zipEndOfCentral(files.length, central.byteLength, offset);
+  let index = 0;
+  let phase = files.length === 0 ? "tail" : "local";
+  let reader = null;
+  return new ReadableStream({
+    async pull(controller) {
+      while (true) {
+        if (phase === "tail") {
+          if (central.byteLength) controller.enqueue(central);
+          controller.enqueue(end);
+          controller.close();
+          return;
+        }
+        if (phase === "local") {
+          controller.enqueue(locals[index]);
+          const body = await open(index);
+          if (!body) {
+            controller.error(new Error(`Missing zip entry ${files[index].name}`));
+            return;
+          }
+          reader = body.getReader();
+          phase = "body";
+          return;
+        }
+        const next = await reader.read();
+        if (next.done) {
+          reader.releaseLock();
+          reader = null;
+          index += 1;
+          phase = index >= files.length ? "tail" : "local";
+          continue;
+        }
+        controller.enqueue(next.value);
+        return;
+      }
+    },
+    cancel(reason) {
+      return reader?.cancel(reason);
+    }
+  });
+}
+
 // src/store.ts
 var INDEX_KEY = "idx:projects";
 function projectKey(id) {
   return `proj:${id}`;
 }
-function fileKey(token) {
+function publicFileKey(token) {
   return `file:${token}`;
+}
+function fileKey(token) {
+  return publicFileKey(token);
+}
+function renderTokenKey(token) {
+  return `rendertoken:${token}`;
+}
+async function readRenderToken(kv, token) {
+  const raw = await kv.get(renderTokenKey(token), { type: "text" });
+  if (typeof raw !== "string" || !raw) return null;
+  return JSON.parse(raw);
+}
+async function writeRenderToken(kv, token, record) {
+  await kv.put(renderTokenKey(token), JSON.stringify(record));
+}
+async function putStoreZip(kv, token, files, when = "2020-01-01T00:00:00.000Z") {
+  const meta = {
+    chunks: 0,
+    size: storeZipByteLength(files),
+    encoding: "store-zip",
+    contentType: "application/zip",
+    files,
+    when
+  };
+  await kv.put(`${publicFileKey(token)}:meta`, JSON.stringify(meta));
 }
 function docKey(id) {
   return `proj:${id}:doc`;
@@ -22419,17 +22624,11 @@ async function rememberFile(kv, id, token) {
   envelope.fileTokens = [.../* @__PURE__ */ new Set([...envelope.fileTokens || [], token])];
   await kv.put(`${projectKey(id)}:envelope`, JSON.stringify(envelope));
 }
-async function putPublicFile(kv, token, bytes, contentType) {
-  await putBytes(kv, fileKey(token), bytes, contentType);
-}
-async function getPublicFile(kv, token) {
-  return getBytes(kv, fileKey(token));
-}
 
 // src/render.ts
 var BROWSER_KEEP_ALIVE_MS = 18e4;
-var BROWSER_RETRY_DELAYS_MS = [2e3, 8e3];
-var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var BROWSER_LAUNCH_ATTEMPTS = 2;
+var RENDER_WALL_MS = 5e4;
 function isBrowserRateLimit(error) {
   const message = error instanceof Error ? error.message : String(error);
   return /\b429\b/.test(message) || /rate limit/i.test(message);
@@ -22445,7 +22644,7 @@ function browserRateLimitError(cause, limits2) {
   const seconds = waitMs != null ? Math.max(1, Math.ceil(waitMs / 1e3)) : 60;
   const daily = /daily|browser hours|duration quota/i.test(raw) ? " If the message is the free-plan daily browser-time cap, retry after that allowance resets." : "";
   return new Error(
-    `Browser Rendering rate limit: ${raw}. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A free session is reused when one is still alive, and every screenshot in one call shares that browser.${daily}`
+    `Browser Rendering rate limit: ${raw}. retry-after: ${seconds} seconds. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A healthy disconnected session is reused. A failed render closes its session.${daily}`
   );
 }
 async function connectFreeSession(puppeteer2, endpoint) {
@@ -22472,28 +22671,32 @@ async function readLimits(puppeteer2, endpoint) {
     return null;
   }
 }
-function retryDelay(attempt, limits2) {
-  const indicated = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
-  if (indicated == null) return BROWSER_RETRY_DELAYS_MS[attempt] ?? 8e3;
-  return Math.min(Math.max(indicated, 250), 15e3);
-}
-async function acquireBrowser(puppeteer2, endpoint, wait = sleep) {
+async function acquireBrowser(puppeteer2, endpoint, _wait = () => Promise.resolve()) {
   const existing = await connectFreeSession(puppeteer2, endpoint);
-  if (existing) return existing;
+  if (existing) {
+    logStage("browser_acquired", { reused: true });
+    return existing;
+  }
   let lastError;
   let lastLimits = null;
-  const attempts = BROWSER_RETRY_DELAYS_MS.length + 1;
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  for (let attempt = 0; attempt < BROWSER_LAUNCH_ATTEMPTS; attempt++) {
     try {
-      return await puppeteer2.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
+      const handle = await puppeteer2.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
+      logStage("browser_acquired", { reused: false, attempt });
+      return handle;
     } catch (error) {
       lastError = error;
       if (!isBrowserRateLimit(error)) throw error;
       lastLimits = await readLimits(puppeteer2, endpoint);
-      if (attempt === attempts - 1) throw browserRateLimitError(error, lastLimits);
-      await wait(retryDelay(attempt, lastLimits));
       const freed = await connectFreeSession(puppeteer2, endpoint);
-      if (freed) return freed;
+      if (freed) {
+        logStage("browser_acquired", { reused: true, attempt });
+        return freed;
+      }
+      const allowed = lastLimits?.allowedBrowserAcquisitions ?? 0;
+      if (allowed <= 0 || attempt === BROWSER_LAUNCH_ATTEMPTS - 1) {
+        throw browserRateLimitError(error, lastLimits);
+      }
     }
   }
   throw browserRateLimitError(lastError, lastLimits);
@@ -22509,41 +22712,21 @@ async function releaseBrowser(browser, discard = false) {
   }
   if (typeof browser.close === "function") await browser.close();
 }
-function fulfillRenderRequest(rawUrl, supply) {
-  let url;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return { kind: "continue" };
+function parseUploads(value) {
+  const slots = /* @__PURE__ */ new Map();
+  for (const part of String(value || "").split(",")) {
+    const splitAt = part.indexOf(":");
+    if (splitAt <= 0) continue;
+    const index = part.slice(0, splitAt);
+    const token = part.slice(splitAt + 1);
+    if (!/^\d+$/.test(index) || !/^[a-f0-9]{64}$/i.test(token)) continue;
+    slots.set(Number(index), token.toLowerCase());
   }
-  if (/\/api\/projects\/[^/]+$/.test(url.pathname)) {
-    return {
-      kind: "respond",
-      status: 200,
-      contentType: "application/json; charset=utf-8",
-      body: supply.projectBody,
-      headers: { "cache-control": "no-store" }
-    };
-  }
-  const asset = url.pathname.match(/\/assets\/([a-f0-9]{64})$/i);
-  if (!asset) return { kind: "continue" };
-  const blob = supply.assets.get(asset[1].toLowerCase());
-  if (!blob) return { kind: "missing", url: rawUrl };
-  return {
-    kind: "respond",
-    status: 200,
-    contentType: blob.mime,
-    body: blob.bytes,
-    headers: { "cache-control": "no-store" }
-  };
+  return slots;
 }
-async function sha256Hex(bytes) {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-async function assertRenderedFrames(shots, sources) {
+function assertRenderedFrames(shots, sources) {
   if (shots.length < 2) return;
-  const hashes = await Promise.all(shots.map((shot) => sha256Hex(shot.png)));
+  const hashes = shots.map((shot) => shot.sha256);
   const allSame = hashes.every((hash) => hash === hashes[0]);
   const distinctImages = new Set(sources.map((source2) => source2.image).filter(Boolean));
   const panorama = sources.some((source2) => source2.panorama);
@@ -22568,100 +22751,95 @@ async function assertRenderedFrames(shots, sources) {
     }
   }
 }
-function respondBody(body) {
-  if (typeof body === "string") return body;
-  return Buffer.from(body);
-}
-async function installSupply(page, supply) {
-  if (!page.setRequestInterception || !page.on) {
-    throw new Error("This browser cannot intercept asset requests, so render would loop back to /assets and can capture a broken frame.");
+function frameFromPage(shot, index, token) {
+  if (!shot || shot.index !== index || String(shot.token || "").toLowerCase() !== token) {
+    throw new Error(`Screenshot ${index} did not upload.`);
   }
-  let interceptError = "";
-  await page.setRequestInterception(true);
-  page.on("request", async (request) => {
-    try {
-      const decision = fulfillRenderRequest(request.url(), supply);
-      if (decision.kind === "continue") {
-        await request.continue();
-        return;
-      }
-      if (decision.kind === "missing") {
-        interceptError = `Render asset failed to load: ${decision.url}`;
-        await request.respond({ status: 404, contentType: "text/plain", body: interceptError, headers: { "cache-control": "no-store" } });
-        return;
-      }
-      await request.respond({
-        status: decision.status,
-        contentType: decision.contentType,
-        headers: decision.headers,
-        body: respondBody(decision.body)
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      interceptError = interceptError || `Render request failed for ${request.url()}: ${message}`;
-      try {
-        await request.abort?.("failed");
-      } catch {
-      }
-    }
-  });
-  return () => interceptError;
+  if (!Number.isInteger(shot.width) || shot.width <= 0 || !Number.isInteger(shot.height) || shot.height <= 0) {
+    throw new Error(`Screenshot ${index} reported an invalid size.`);
+  }
+  if (!Number.isInteger(shot.bytes) || shot.bytes <= 0) {
+    throw new Error(`Screenshot ${index} reported an empty PNG.`);
+  }
+  if (!/^[a-f0-9]{64}$/i.test(shot.sha256 || "")) {
+    throw new Error(`Screenshot ${index} did not report a sha256.`);
+  }
+  if (!Number.isInteger(shot.crc) || shot.crc < 0 || shot.crc > 4294967295) {
+    throw new Error(`Screenshot ${index} did not report a crc32.`);
+  }
+  return {
+    index,
+    token,
+    width: shot.width,
+    height: shot.height,
+    bytes: shot.bytes,
+    sha256: shot.sha256.toLowerCase(),
+    crc: shot.crc >>> 0
+  };
+}
+function remaining(deadline) {
+  return Math.max(1e3, deadline - Date.now());
 }
 async function renderScreenshots(env, pageUrl, indices, hooks) {
   if (!env.BROWSER && !hooks?.puppeteer) {
     throw new Error("Browser Rendering binding BROWSER is not configured.");
   }
+  const uploads = parseUploads(new URL(pageUrl).searchParams.get("uploads"));
+  for (const index of indices) {
+    if (!uploads.get(index)) throw new Error(`Screenshot ${index} has no upload token.`);
+  }
   const puppeteer2 = hooks?.puppeteer ?? (await Promise.resolve().then(() => (init_puppeteer_cloudflare(), puppeteer_cloudflare_exports))).default;
   const browser = await acquireBrowser(puppeteer2, env.BROWSER, hooks?.sleep);
+  const deadline = Date.now() + RENDER_WALL_MS;
   let page;
   let discard = false;
   try {
     page = await browser.newPage();
     await page.setViewport({ width: 900, height: 900, deviceScaleFactor: 1 });
     if (page.setCacheEnabled) await page.setCacheEnabled(false);
-    const interceptionError = hooks?.supply ? await installSupply(page, hooks.supply) : null;
     const opened = new URL(pageUrl);
     opened.searchParams.set("cb", String(Date.now()));
-    await page.goto(opened.toString(), { waitUntil: "networkidle0", timeout: 9e4 });
-    if (interceptionError) {
-      const missed = interceptionError();
-      if (missed) throw new Error(missed);
+    try {
+      await page.goto(opened.toString(), { waitUntil: "networkidle0", timeout: remaining(deadline) });
+      logStage("page_opened", { indexes: indices });
+      await page.waitForFunction(
+        () => {
+          const status = document.documentElement.dataset.appscreenStatus;
+          return status === "done" || status === "error";
+        },
+        { timeout: remaining(deadline) }
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timeout|timed out/i.test(message)) {
+        throw new Error(
+          `Render timed out after ${RENDER_WALL_MS}ms. The page did not finish uploading. On the Workers Free plan a browser session is short, and a multi-screenshot 3D export can exceed it.`
+        );
+      }
+      throw error;
     }
-    await page.waitForFunction(
-      () => {
-        const status2 = document.documentElement.dataset.appscreenStatus;
-        return status2 === "ready" || status2 === "error";
-      },
-      { timeout: 9e4 }
-    );
-    const status = await page.evaluate(() => ({
+    const reported = await page.evaluate(() => ({
       status: document.documentElement.dataset.appscreenStatus || "",
-      error: document.documentElement.dataset.appscreenError || window.__appscreenError || ""
+      error: document.documentElement.dataset.appscreenError || "",
+      result: document.documentElement.dataset.appscreenResult || ""
     }));
-    if (interceptionError) {
-      const missed = interceptionError();
-      if (missed) throw new Error(missed);
+    if (reported.status === "error") {
+      throw new Error(reported.error || "Headless render failed in the Pages app.");
     }
-    if (status.status === "error") {
-      throw new Error(status.error || "Headless render failed in the Pages app.");
+    if (reported.status !== "done") {
+      throw new Error(`Render page finished as "${reported.status || "empty"}" without uploading.`);
     }
-    const shots = await page.evaluate(async (wanted) => {
-      const hook = window.__appscreen;
-      if (!hook) throw new Error("window.__appscreen is missing.");
-      const out = [];
-      for (const index of wanted) out.push(await hook.capture(index));
-      return out;
-    }, indices);
-    return shots.map((shot) => {
-      const match = /^data:image\/png;base64,(.+)$/i.exec(shot.dataUrl || "");
-      if (!match) throw new Error(`Screenshot ${shot.index} did not return a PNG data URL.`);
-      const binary = atob(match[1]);
-      const png = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) png[i] = binary.charCodeAt(i);
-      return { index: shot.index, png, width: shot.width, height: shot.height };
-    });
+    let parsed;
+    try {
+      parsed = JSON.parse(reported.result || "{}");
+    } catch {
+      throw new Error("Render page returned a result that was not JSON.");
+    }
+    const shots = parsed.shots || [];
+    return indices.map((index) => frameFromPage(shots.find((shot) => shot.index === index), index, uploads.get(index)));
   } catch (error) {
     discard = true;
+    logStage("render_error", { message: error instanceof Error ? error.message : String(error), indexes: indices });
     throw error;
   } finally {
     if (page?.close) {
@@ -22672,83 +22850,6 @@ async function renderScreenshots(env, pageUrl, indices, hooks) {
     }
     await releaseBrowser(browser, discard);
   }
-}
-
-// src/zip.ts
-var CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
-    table[n] = c >>> 0;
-  }
-  return table;
-})();
-function crc32(bytes) {
-  let c = 4294967295;
-  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 255] ^ c >>> 8;
-  return (c ^ 4294967295) >>> 0;
-}
-function dosTime(date = /* @__PURE__ */ new Date()) {
-  const time = date.getHours() << 11 | date.getMinutes() << 5 | Math.floor(date.getSeconds() / 2);
-  const d = date.getFullYear() - 1980 << 9 | date.getMonth() + 1 << 5 | date.getDate();
-  return { time, date: d };
-}
-function zipStore(files, when = /* @__PURE__ */ new Date()) {
-  const enc = new TextEncoder();
-  const { time, date } = dosTime(when);
-  const locals = [];
-  const centrals = [];
-  let offset = 0;
-  for (const file of files) {
-    const name = enc.encode(file.name);
-    const crc = crc32(file.data);
-    const local = new Uint8Array(30 + name.length);
-    const lv = new DataView(local.buffer);
-    lv.setUint32(0, 67324752, true);
-    lv.setUint16(4, 20, true);
-    lv.setUint16(8, 0, true);
-    lv.setUint16(10, time, true);
-    lv.setUint16(12, date, true);
-    lv.setUint32(14, crc, true);
-    lv.setUint32(18, file.data.byteLength, true);
-    lv.setUint32(22, file.data.byteLength, true);
-    lv.setUint16(26, name.length, true);
-    local.set(name, 30);
-    locals.push(local, file.data);
-    const central = new Uint8Array(46 + name.length);
-    const cv = new DataView(central.buffer);
-    cv.setUint32(0, 33639248, true);
-    cv.setUint16(4, 20, true);
-    cv.setUint16(6, 20, true);
-    cv.setUint16(10, 0, true);
-    cv.setUint16(12, time, true);
-    cv.setUint16(14, date, true);
-    cv.setUint32(16, crc, true);
-    cv.setUint32(20, file.data.byteLength, true);
-    cv.setUint32(24, file.data.byteLength, true);
-    cv.setUint16(28, name.length, true);
-    cv.setUint32(42, offset, true);
-    central.set(name, 46);
-    centrals.push(central);
-    offset += local.length + file.data.byteLength;
-  }
-  const centralSize = centrals.reduce((n, c) => n + c.length, 0);
-  const end = new Uint8Array(22);
-  const ev = new DataView(end.buffer);
-  ev.setUint32(0, 101010256, true);
-  ev.setUint16(8, files.length, true);
-  ev.setUint16(10, files.length, true);
-  ev.setUint32(12, centralSize, true);
-  ev.setUint32(16, offset, true);
-  const total = offset + centralSize + end.length;
-  const out = new Uint8Array(total);
-  let cursor = 0;
-  for (const part of [...locals, ...centrals, end]) {
-    out.set(part, cursor);
-    cursor += part.length;
-  }
-  return out;
 }
 
 // src/tools.ts
@@ -22927,7 +23028,7 @@ var TOOLS = [
   },
   {
     name: "render_preview",
-    description: "Render one screenshot to a PNG at the project's exact output pixel size using the hosted app (2D canvas and three.js). Returns a public URL. Set inline true to also embed the PNG.",
+    description: "Render one screenshot to a PNG at the project's exact output pixel size. The browser uploads the PNG. Returns a public URL. inline is accepted and ignored: image bytes are not copied back through this Worker.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22941,7 +23042,7 @@ var TOOLS = [
   },
   {
     name: "export_project",
-    description: "Render every screenshot to PNG and a ZIP. Returns public unguessable URLs.",
+    description: "Render every screenshot in one browser session. The page uploads each PNG. Returns public PNG URLs and a ZIP URL. The ZIP is uncompressed and streamed on download.",
     inputSchema: {
       type: "object",
       properties: {
@@ -23071,22 +23172,9 @@ async function defaultLoadImage(url) {
   const bytes = new Uint8Array(await response.arrayBuffer());
   return { mime, bytes };
 }
-async function storeRendered(services, projectId, bytes, contentType, filename) {
-  const token = randomToken();
-  await putPublicFile(services.env.APPSCREEN_KV, token, bytes, contentType);
-  await rememberFile(services.env.APPSCREEN_KV, projectId, token);
-  const url = new URL(`/f/${token}/${filename}`, services.publicOrigin);
-  return url.toString();
+function publicFileUrl(services, token, filename) {
+  return new URL(`/f/${token}/${filename}`, services.publicOrigin).toString();
 }
-function bytesToBase642(bytes) {
-  let binary = "";
-  const stride = 32768;
-  for (let i = 0; i < bytes.length; i += stride) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + stride));
-  }
-  return btoa(binary);
-}
-var INLINE_LIMIT = 4 * 1024 * 1024;
 async function callTool(services, name, args) {
   switch (name) {
     case "list_projects": {
@@ -23264,24 +23352,19 @@ async function callTool(services, name, args) {
       }
       const shots = await renderProject(services, envelope, backup, [index]);
       const shot = shots[0];
-      const url = await storeRendered(services, envelope.id, shot.png, "image/png", `screenshot-${index + 1}.png`);
       const data = {
         project_id: envelope.id,
         index,
-        url,
+        url: publicFileUrl(services, shot.token, `screenshot-${index + 1}.png`),
         width: shot.width,
         height: shot.height,
-        bytes: shot.png.byteLength
+        bytes: shot.bytes,
+        sha256: shot.sha256
       };
-      const images = [];
       if (args.inline === true) {
-        if (shot.png.byteLength > INLINE_LIMIT) {
-          data.inline_omitted = `PNG is ${shot.png.byteLength} bytes, above the ${INLINE_LIMIT} byte inline limit. Use url.`;
-        } else {
-          images.push({ base64: bytesToBase642(shot.png), mimeType: "image/png" });
-        }
+        data.inline_omitted = "The PNG stays in KV. This Worker does not copy image bytes back into the tool result. Use url.";
       }
-      return { data, images };
+      return { data };
     }
     case "export_project": {
       const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
@@ -23291,22 +23374,32 @@ async function callTool(services, name, args) {
       }
       const indexes = project.screenshots.map((_, i) => i);
       const shots = await renderProject(services, envelope, backup, indexes);
-      const pngs = [];
-      const zipEntries = [];
-      for (const shot of shots) {
-        const filename = `screenshot-${shot.index + 1}.png`;
-        const url = await storeRendered(services, envelope.id, shot.png, "image/png", filename);
-        pngs.push({ index: shot.index, url, width: shot.width, height: shot.height, bytes: shot.png.byteLength });
-        zipEntries.push({ name: filename, data: shot.png });
-      }
-      const zip = zipStore(zipEntries);
-      const zipUrl = await storeRendered(services, envelope.id, zip, "application/zip", "screenshots.zip");
+      const pngs = shots.map((shot) => ({
+        index: shot.index,
+        url: publicFileUrl(services, shot.token, `screenshot-${shot.index + 1}.png`),
+        width: shot.width,
+        height: shot.height,
+        bytes: shot.bytes,
+        sha256: shot.sha256
+      }));
+      const zipToken = randomToken();
+      await putStoreZip(
+        services.env.APPSCREEN_KV,
+        zipToken,
+        shots.map((shot) => ({
+          name: `screenshot-${shot.index + 1}.png`,
+          key: publicFileKey(shot.token),
+          crc: shot.crc,
+          size: shot.bytes
+        }))
+      );
+      await rememberFile(services.env.APPSCREEN_KV, envelope.id, zipToken);
       return {
         data: {
           project_id: envelope.id,
           output: outputSizeOf(project),
           pngs,
-          zip_url: zipUrl
+          zip_url: publicFileUrl(services, zipToken, "screenshots.zip")
         }
       };
     }
@@ -23327,16 +23420,53 @@ async function renderProject(services, envelope, backup, indexes) {
   if (!services.renderScreenshots) {
     throw new ProjectError("render_unavailable", "Browser rendering is not configured.");
   }
-  const url = renderUrl(services, envelope.id, envelope.editKey, indexes.length === 1 ? String(indexes[0]) : "all");
+  const kv = services.env.APPSCREEN_KV;
+  logStage("render_start", { projectId: envelope.id, indexes });
   try {
     return await withRenderLock(services.env, envelope.id, async () => {
-      const supply = await buildRenderSupply(services.env.APPSCREEN_KV, backup);
-      const shots = await services.renderScreenshots(url, indexes, supply);
+      await assertAssetsPresent(kv, backup);
+      const slots = indexes.map((index) => ({
+        index,
+        token: randomToken(),
+        filename: `screenshot-${index + 1}.png`
+      }));
+      for (const slot of slots) {
+        await writeRenderToken(kv, slot.token, {
+          projectId: envelope.id,
+          index: slot.index,
+          filename: slot.filename,
+          uploaded: false
+        });
+      }
+      const page = new URL(renderUrl(services, envelope.id, envelope.editKey, indexes.length === 1 ? String(indexes[0]) : "all"));
+      page.searchParams.set("uploads", slots.map((slot) => `${slot.index}:${slot.token}`).join(","));
+      const issued = parseUploads(page.searchParams.get("uploads"));
+      const frames = await services.renderScreenshots(page.toString(), indexes);
+      const ordered = indexes.map((index) => {
+        const frame = frames.find((shot) => shot.index === index);
+        if (!frame || frame.token !== issued.get(index)) {
+          throw new ProjectError("render_failed", `Screenshot ${index} did not upload.`);
+        }
+        return frame;
+      });
       const sources = renderSourceKeys(backup);
-      await assertRenderedFrames(shots, indexes.map((index) => sources[index] || { image: "", panorama: false }));
-      return shots;
+      assertRenderedFrames(ordered, indexes.map((index) => sources[index] || { image: "", panorama: false }));
+      for (const frame of ordered) {
+        const record = await readRenderToken(kv, frame.token);
+        if (!record?.uploaded || record.sha256 !== frame.sha256 || record.bytes !== frame.bytes || record.crc !== frame.crc) {
+          throw new ProjectError("render_failed", `Screenshot ${frame.index} did not upload.`);
+        }
+        await rememberFile(kv, envelope.id, frame.token);
+      }
+      logStage("render_done", { projectId: envelope.id, indexes, bytes: ordered.map((frame) => frame.bytes) });
+      return ordered;
     });
   } catch (error) {
+    if (!(error instanceof ProjectError)) {
+      logStage("render_error", { projectId: envelope.id, message: error instanceof Error ? error.message : String(error) });
+    } else if (error.code !== "render_busy") {
+      logStage("render_error", { projectId: envelope.id, message: error.message });
+    }
     if (error instanceof ProjectError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new ProjectError("render_failed", message);
@@ -23484,7 +23614,10 @@ function corsHeaders(request, env) {
   headers.set("Access-Control-Allow-Origin", origin);
   headers.set("Vary", "Origin");
   headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Edit-Key, Accept");
+  headers.set(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, X-Edit-Key, Accept, X-Appscreen-Crc, X-Appscreen-Width, X-Appscreen-Height, X-Appscreen-Sha256, X-Appscreen-Index"
+  );
   headers.set("Access-Control-Max-Age", "86400");
   return headers;
 }
@@ -23552,29 +23685,16 @@ async function routeInner(request, env, renderScreenshots2) {
   }
   const assetMatch = url.pathname.match(/^\/assets\/([a-f0-9]{64})$/i);
   if (assetMatch && request.method === "GET") {
-    const file = await getBytes(env.APPSCREEN_KV, `asset:${assetMatch[1].toLowerCase()}`);
-    if (!file) return json({ error: "not_found" }, 404);
-    return new Response(file.bytes, {
-      status: 200,
-      headers: {
-        "content-type": file.contentType,
-        "content-length": String(file.bytes.byteLength),
-        "cache-control": "public, max-age=31536000, immutable"
-      }
-    });
+    return streamAsset(env, assetMatch[1].toLowerCase());
+  }
+  const renderMatch = url.pathname.match(/^\/renders\/([a-f0-9]{64})$/i);
+  if (renderMatch && request.method === "PUT") {
+    return putRender(request, env, renderMatch[1].toLowerCase());
   }
   const fileMatch = url.pathname.match(/^\/f\/([a-f0-9]{32,128})(?:\/([^/]+))?$/i);
   if (fileMatch && request.method === "GET") {
-    const file = await getPublicFile(env.APPSCREEN_KV, fileMatch[1]);
-    if (!file) return json({ error: "not_found" }, 404);
     const filename = fileMatch[2] ? decodeURIComponent(fileMatch[2]) : "download";
-    const headers = new Headers({
-      "content-type": file.contentType,
-      "content-length": String(file.bytes.byteLength),
-      "cache-control": "public, max-age=31536000, immutable",
-      "content-disposition": `${file.contentType === "application/zip" ? "attachment" : "inline"}; filename="${filename.replace(/"/g, "")}"`
-    });
-    return new Response(file.bytes, { status: 200, headers });
+    return streamPublicFile(env, fileMatch[1], filename);
   }
   const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
   if (projectMatch) {
@@ -23584,6 +23704,118 @@ async function routeInner(request, env, renderScreenshots2) {
     return json({ error: "method_not_allowed" }, 405);
   }
   return json({ error: "not_found" }, 404);
+}
+var IMMUTABLE = "public, max-age=31536000, immutable";
+function contentLength(request) {
+  const raw = request.headers.get("content-length");
+  if (raw == null || !/^\d+$/.test(raw)) return null;
+  const size = Number(raw);
+  return Number.isSafeInteger(size) ? size : null;
+}
+function integerHeader(request, name) {
+  const raw = request.headers.get(name);
+  if (raw == null || !/^\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
+}
+async function streamAsset(env, hash) {
+  const key = `asset:${hash}`;
+  const meta = await readBlobMeta(env.APPSCREEN_KV, key);
+  if (!meta || meta.encoding !== "bytes") return json({ error: "not_found" }, 404);
+  const opened = await openByteStream(env.APPSCREEN_KV, key);
+  if (!opened) return json({ error: "not_found" }, 404);
+  logStage("asset_stream", { hash, bytes: opened.size, chunks: meta.chunks });
+  return new Response(opened.stream, {
+    status: 200,
+    headers: {
+      "content-type": opened.contentType,
+      "content-length": String(opened.size),
+      "cache-control": IMMUTABLE
+    }
+  });
+}
+async function streamPublicFile(env, token, filename) {
+  const key = publicFileKey(token);
+  const meta = await readBlobMeta(env.APPSCREEN_KV, key);
+  if (!meta) return json({ error: "not_found" }, 404);
+  const safeName = filename.replace(/"/g, "");
+  const disposition = `${meta.contentType === "application/zip" ? "attachment" : "inline"}; filename="${safeName}"`;
+  if (meta.encoding === "store-zip") {
+    const files = meta.files || [];
+    const stream = storeZipStream(
+      files.map((file) => ({ name: file.name, crc: file.crc, size: file.size })),
+      async (index) => {
+        const opened2 = await openByteStream(env.APPSCREEN_KV, files[index].key);
+        return opened2 ? opened2.stream : null;
+      },
+      new Date(meta.when || "2020-01-01T00:00:00.000Z")
+    );
+    logStage("zip_stream", { files: files.length, bytes: meta.size });
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "content-type": "application/zip",
+        "content-length": String(meta.size),
+        "cache-control": IMMUTABLE,
+        "content-disposition": disposition
+      }
+    });
+  }
+  if (meta.encoding !== "bytes") return json({ error: "not_found" }, 404);
+  const opened = await openByteStream(env.APPSCREEN_KV, key);
+  if (!opened) return json({ error: "not_found" }, 404);
+  return new Response(opened.stream, {
+    status: 200,
+    headers: {
+      "content-type": opened.contentType,
+      "content-length": String(opened.size),
+      "cache-control": IMMUTABLE,
+      "content-disposition": disposition
+    }
+  });
+}
+async function putRender(request, env, token) {
+  const record = await readRenderToken(env.APPSCREEN_KV, token);
+  if (!record) return json({ error: "not_found", message: "Upload token is unknown." }, 404);
+  const index = integerHeader(request, "x-appscreen-index");
+  const width = integerHeader(request, "x-appscreen-width");
+  const height = integerHeader(request, "x-appscreen-height");
+  const crc = integerHeader(request, "x-appscreen-crc");
+  const sha = (request.headers.get("x-appscreen-sha256") || "").toLowerCase();
+  if (index !== record.index || width == null || width <= 0 || height == null || height <= 0) {
+    return json({ error: "invalid_upload", message: "Screenshot index and pixel size are required." }, 400);
+  }
+  if (crc == null || crc > 4294967295 || !/^[a-f0-9]{64}$/.test(sha)) {
+    return json({ error: "invalid_upload", message: "Screenshot crc32 and sha256 are required." }, 400);
+  }
+  const size = contentLength(request);
+  if (size == null) {
+    return json({ error: "length_required", message: "Content-Length is required. The body is stored as a stream." }, 411);
+  }
+  if (size <= 0) return json({ error: "invalid_upload", message: "Rendered PNG is empty." }, 400);
+  if (size > KV_VALUE_LIMIT) {
+    return json(
+      {
+        error: "kv_limit",
+        message: `Rendered PNG is ${size} bytes, above the ${KV_VALUE_LIMIT} byte KV value limit. The upload was not read.`
+      },
+      413
+    );
+  }
+  if (!request.body) return json({ error: "invalid_upload", message: "Rendered PNG body is missing." }, 400);
+  await putStreamedBytes(env.APPSCREEN_KV, publicFileKey(token), request.body, size, "image/png");
+  await writeRenderToken(env.APPSCREEN_KV, token, {
+    ...record,
+    uploaded: true,
+    bytes: size,
+    width,
+    height,
+    sha256: sha,
+    crc
+  });
+  logStage("render_upload", { index, bytes: size, sha256: sha });
+  const url = new URL(`/f/${token}/${record.filename}`, publicOrigin(request, env));
+  return json({ ok: true, bytes: size, url: url.toString() });
 }
 async function getProject(request, env, id) {
   const envelope = await getEnvelope(env.APPSCREEN_KV, id);
@@ -23657,7 +23889,7 @@ async function putProject(request, env, id) {
 // src/index.ts
 var index_default = {
   async fetch(request, env) {
-    return route(request, env, (pageUrl, indices, supply) => renderScreenshots(env, pageUrl, indices, { supply }));
+    return route(request, env, (pageUrl, indices) => renderScreenshots(env, pageUrl, indices));
   }
 };
 export {

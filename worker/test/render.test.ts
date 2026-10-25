@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildRenderSupply, storeAsset } from "../src/assets.ts";
+import { assertAssetsPresent, storeAsset } from "../src/assets.ts";
 import { addScreenshot, createBackup } from "../src/project.ts";
 import {
   acquireBrowser,
   acquisitionWaitMs,
   assertRenderedFrames,
   BROWSER_KEEP_ALIVE_MS,
+  BROWSER_LAUNCH_ATTEMPTS,
   browserRateLimitError,
-  fulfillRenderRequest,
   isBrowserRateLimit,
   renderScreenshots,
   type BrowserHandle,
@@ -44,6 +44,7 @@ describe("browser sessions", () => {
     assert.equal(acquisitionWaitMs(45_000), 45_000);
     assert.equal(acquisitionWaitMs(60), 60_000);
     assert.equal(acquisitionWaitMs(0), null);
+    assert.match(browserRateLimitError(new Error(RATE_LIMIT)).message, /retry-after: 60 seconds/);
     assert.match(browserRateLimitError(new Error(RATE_LIMIT)).message, /Wait about 60 seconds/);
     assert.match(
       browserRateLimitError(new Error(RATE_LIMIT), { timeUntilNextAllowedBrowserAcquisition: 45_000 }).message,
@@ -122,7 +123,7 @@ describe("browser sessions", () => {
       sleeps.push(ms);
     });
     assert.equal(launches, 1);
-    assert.deepEqual(sleeps, [5_000]);
+    assert.deepEqual(sleeps, []);
     assert.equal((handle as { id: string }).id, "after-limit");
   });
 
@@ -152,35 +153,78 @@ describe("browser sessions", () => {
         const message = error instanceof Error ? error.message : String(error);
         assert.match(message, /429/);
         assert.match(message, /per-minute limit on creating a new browser/);
+        assert.match(message, /retry-after: 45 seconds/);
         assert.match(message, /Wait about 45 seconds/);
         assert.match(message, /render_preview or export_project/);
         return true;
       },
     );
-    assert.equal(launches, 3);
-    assert.deepEqual(sleeps, [15_000, 15_000]);
+    assert.equal(launches, 1);
+    assert.deepEqual(sleeps, []);
+  });
+
+  it("launches at most twice and does not sleep when another acquisition is allowed", async () => {
+    const sleeps: number[] = [];
+    let launches = 0;
+    const puppeteer: PuppeteerBinding = {
+      async sessions() {
+        return [];
+      },
+      async connect() {
+        throw new Error("no free session");
+      },
+      async launch() {
+        launches += 1;
+        throw new Error(RATE_LIMIT);
+      },
+      async limits() {
+        return { allowedBrowserAcquisitions: 1, timeUntilNextAllowedBrowserAcquisition: 1_000 };
+      },
+    };
+    await assert.rejects(() => acquireBrowser(puppeteer, {}, async (ms) => {
+      sleeps.push(ms);
+    }), /retry-after: 1 seconds/);
+    assert.equal(BROWSER_LAUNCH_ATTEMPTS, 2);
+    assert.equal(launches, 2);
+    assert.deepEqual(sleeps, []);
   });
 });
 
 describe("renderScreenshots", () => {
-  it("captures every index in one browser and disconnects to keep the session", async () => {
-    const evaluated: unknown[] = [];
+  it("waits for the page upload and disconnects a healthy session", async () => {
     let launches = 0;
     let closes = 0;
     let disconnects = 0;
+    let intercepted = false;
+    const tokens = [0, 1, 2].map((index) => `${index === 0 ? "ab" : index === 1 ? "cd" : "ef"}${"01".repeat(31)}`);
     const page = {
       async setViewport() {},
-      async goto() {},
+      async setRequestInterception() {
+        intercepted = true;
+        throw new Error("request interception must not run");
+      },
+      async goto(url: string) {
+        assert.match(url, /cb=/);
+        assert.match(url, /uploads=/);
+        assert.equal(url.includes("data:image"), false);
+      },
       async waitForFunction() {},
-      async evaluate(_fn: unknown, arg?: unknown) {
-        if (arg === undefined) return { status: "ready", error: "" };
-        evaluated.push(arg);
-        return (arg as number[]).map((index) => ({
-          index,
-          width: 10,
-          height: 20,
-          dataUrl: "data:image/png;base64,QQ==",
-        }));
+      async evaluate() {
+        return {
+          status: "done",
+          error: "",
+          result: JSON.stringify({
+            shots: tokens.map((token, index) => ({
+              index,
+              token,
+              width: 10 + index,
+              height: 20,
+              bytes: 1000 + index,
+              sha256: (index + 1).toString(16).padStart(64, "0"),
+              crc: 10 + index,
+            })),
+          }),
+        };
       },
       async close() {
         closes += 1;
@@ -208,11 +252,14 @@ describe("renderScreenshots", () => {
         };
       },
     };
-    const shots = await renderScreenshots({ BROWSER: {} }, "https://example.test/?render=all", [0, 1, 2], { puppeteer });
+    const pageUrl = `https://example.test/?render=all&uploads=${tokens.map((token, index) => `${index}:${token}`).join(",")}`;
+    const shots = await renderScreenshots({ BROWSER: {} }, pageUrl, [0, 1, 2], { puppeteer });
+    assert.equal(intercepted, false);
     assert.equal(launches, 1);
-    assert.deepEqual(evaluated, [[0, 1, 2]]);
     assert.deepEqual(shots.map((shot) => shot.index), [0, 1, 2]);
-    assert.equal(shots[0].png[0], "A".charCodeAt(0));
+    assert.equal(shots[0].token, tokens[0]);
+    assert.equal(shots[0].bytes, 1000);
+    assert.equal("png" in shots[0], false);
     assert.equal(disconnects, 1);
     assert.equal(closes, 1);
   });
@@ -251,146 +298,53 @@ describe("renderScreenshots", () => {
         };
       },
     };
+    const token = "ab".repeat(32);
     await assert.rejects(
-      () => renderScreenshots({ BROWSER: {} }, "https://example.test/?render=0", [0], { puppeteer }),
-      /Screenshot 0/,
+      () => renderScreenshots({ BROWSER: {} }, `https://example.test/?render=0&uploads=0:${token}`, [0], { puppeteer }),
+      /asset abc/,
     );
     assert.equal(closes, 1);
     assert.equal(disconnects, 0);
   });
 
-  it("fulfills the backup and asset from memory and lets the model download continue", async () => {
-    const kv = createMemoryKv();
-    const photo = new Uint8Array([137, 80, 78, 71, 9]);
-    const pano = new Uint8Array([255, 216, 255, 7]);
-    const photoRef = await storeAsset(kv, photo, "image/png");
-    const panoRef = await storeAsset(kv, pano, "image/jpeg");
-    const dump = createBackup("p1", "HomeBooks");
-    addScreenshot(dump, { dataUrl: `data:image/png;base64,${Buffer.from(photo).toString("base64")}`, name: "one.png" });
-    const backup = JSON.parse(JSON.stringify(dump).replaceAll(`data:image/png;base64,${Buffer.from(photo).toString("base64")}`, photoRef));
-    backup.projects[0].panoramicBackground = { enabled: true, src: panoRef, overlap: 0, scale: 100, offsetY: 0 };
-    const supply = await buildRenderSupply(kv, backup);
-    assert.match(supply.projectBody, /data:image\/png;base64,/);
-    assert.match(supply.projectBody, /data:image\/jpeg;base64,/);
-    assert.equal(supply.projectBody.includes("/assets/"), false);
-    const hash = photoRef.slice("asset:".length);
-    const project = fulfillRenderRequest("https://worker.test/api/projects/p1?cb=1", supply);
-    assert.equal(project.kind, "respond");
-    if (project.kind === "respond") assert.match(String(project.body), /data:image\/png/);
-    const asset = fulfillRenderRequest(`https://worker.test/assets/${hash}`, supply);
-    assert.equal(asset.kind, "respond");
-    if (asset.kind === "respond") assert.equal(asset.headers["cache-control"], "no-store");
-    const model = fulfillRenderRequest("https://matinrahimik.github.io/homebooks-appscreen/models/iphone.glb", supply);
-    assert.equal(model.kind, "continue");
-    const missing = fulfillRenderRequest(`https://worker.test/assets/${"ab".repeat(32)}`, supply);
-    assert.equal(missing.kind, "missing");
-
-    const seen: string[] = [];
-    let projectBody = "";
-    const page = {
-      async setViewport() {},
-      async setCacheEnabled(enabled: boolean) {
-        assert.equal(enabled, false);
-      },
-      async setRequestInterception(value: boolean) {
-        assert.equal(value, true);
-      },
-      on(_event: string, handler: (request: {
-        url: () => string;
-        continue: () => Promise<void>;
-        respond: (response: { body?: string | Uint8Array }) => Promise<void>;
-      }) => Promise<void>) {
-        this.handler = handler;
-      },
-      handler: null as null | ((request: {
-        url: () => string;
-        continue: () => Promise<void>;
-        respond: (response: { body?: string | Uint8Array }) => Promise<void>;
-      }) => Promise<void>),
-      async goto(url: string) {
-        assert.match(url, /cb=/);
-        await this.handler!({
-          url: () => "https://worker.test/api/projects/p1?cb=9",
-          async continue() {
-            throw new Error("project fetch must not hit the network");
-          },
-          async respond(response) {
-            projectBody = String(response.body);
-          },
-        });
-        await this.handler!({
-          url: () => "https://cdn.example/three.min.js",
-          async respond() {
-            throw new Error("the model script should use the network");
-          },
-          async continue() {
-            seen.push("cdn");
-          },
-        });
-      },
-      async waitForFunction() {},
-      async evaluate(_fn: unknown, arg?: unknown) {
-        if (arg === undefined) return { status: "ready", error: "" };
-        return (arg as number[]).map((index) => ({
-          index,
-          width: 10,
-          height: 20,
-          dataUrl: "data:image/png;base64,QQ==",
-        }));
-      },
-      async close() {},
-    };
-    const puppeteer: PuppeteerBinding = {
-      async sessions() {
-        return [];
-      },
-      async connect() {
-        throw new Error("none");
-      },
-      async launch() {
-        return {
-          async newPage() {
-            return page;
-          },
-          async disconnect() {},
-        };
-      },
-    };
-    await renderScreenshots({ BROWSER: {} }, "https://example.test/?render=0", [0], { puppeteer, supply });
-    assert.match(projectBody, /data:image\/jpeg;base64,/);
-    assert.deepEqual(seen, ["cdn"]);
-  });
 });
 
 describe("capture diversity", () => {
-  it("rejects identical frames when the screenshots or panorama differ", async () => {
-    const png = new Uint8Array([1, 2, 3, 4]);
-    await assert.rejects(
+  it("rejects identical frames when the screenshots or panorama differ", () => {
+    const hash = "aa".repeat(32);
+    assert.throws(
       () => assertRenderedFrames(
-        [{ index: 0, png }, { index: 1, png }],
+        [{ index: 0, sha256: hash }, { index: 1, sha256: hash }],
         [{ image: "asset:aaa", panorama: false }, { image: "asset:bbb", panorama: false }],
       ),
       /byte-identical/,
     );
-    await assert.rejects(
+    assert.throws(
       () => assertRenderedFrames(
-        [{ index: 0, png }, { index: 1, png }],
+        [{ index: 0, sha256: hash }, { index: 1, sha256: hash }],
         [{ image: "asset:aaa", panorama: true }, { image: "asset:aaa", panorama: true }],
       ),
       /panoramic background/,
     );
-    await assertRenderedFrames(
-      [{ index: 0, png }, { index: 1, png }],
+    assertRenderedFrames(
+      [{ index: 0, sha256: hash }, { index: 1, sha256: hash }],
       [{ image: "asset:aaa", panorama: false }, { image: "asset:aaa", panorama: false }],
     );
   });
 
-  it("fails the render before launch when an asset blob is missing", async () => {
+  it("checks asset metadata only and names a missing hash", async () => {
     const kv = createMemoryKv();
     const dump = createBackup("p1", "HomeBooks");
     addScreenshot(dump, { dataUrl: "data:image/png;base64,QQ==", name: "one.png" });
-    const backup = JSON.parse(JSON.stringify(dump).replace("data:image/png;base64,QQ==", `asset:${"cd".repeat(32)}`));
-    await assert.rejects(() => buildRenderSupply(kv, backup), /cdcdcdcd/);
+    const missing = "cd".repeat(32);
+    const backup = JSON.parse(JSON.stringify(dump).replace("data:image/png;base64,QQ==", `asset:${missing}`));
+    await assert.rejects(() => assertAssetsPresent(kv, backup), /cdcdcdcd/);
+    const present = await storeAsset(kv, new Uint8Array(64), "image/png");
+    const kept = JSON.parse(JSON.stringify(dump).replace("data:image/png;base64,QQ==", present));
+    const before = kv.gets.length;
+    await assertAssetsPresent(kv, kept);
+    assert.equal(kv.gets.slice(before).every((get) => get.type === "text"), true);
+    assert.equal(kv.gets.slice(before).some((get) => get.type === "arrayBuffer"), false);
   });
 });
 

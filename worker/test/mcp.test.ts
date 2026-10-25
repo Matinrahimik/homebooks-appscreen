@@ -4,7 +4,8 @@ import { readFileSync } from "node:fs";
 import { tokensEqual } from "../src/auth.ts";
 import { route } from "../src/http.ts";
 import { TOOLS } from "../src/tools.ts";
-import type { Env, RenderShot } from "../src/types.ts";
+import type { Env, RenderedFrame } from "../src/types.ts";
+import { crc32 } from "../src/zip.ts";
 import { createMemoryKv } from "./memory-kv.ts";
 
 const TOKEN = "test-token";
@@ -33,14 +34,42 @@ function mcp(body: unknown, token = TOKEN, headers: Record<string, string> = {})
   });
 }
 
+async function digestHex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function pageUpload(e: Env, pageUrl: string, indices: number[], pngFor: (index: number) => Uint8Array): Promise<RenderedFrame[]> {
+  const uploads = new URL(pageUrl).searchParams.get("uploads") || "";
+  const frames: RenderedFrame[] = [];
+  for (const index of indices) {
+    const token = uploads.split(",").map((part) => part.split(":")).find((part) => Number(part[0]) === index)?.[1];
+    if (!token) throw new Error(`missing upload token for ${index}`);
+    const png = pngFor(index);
+    const sha256 = await digestHex(png);
+    const crc = crc32(png);
+    const response = await route(new Request(`https://homebooks-appscreen-mcp.matinrahimi.workers.dev/renders/${token}`, {
+      method: "PUT",
+      headers: {
+        "content-type": "image/png",
+        "content-length": String(png.byteLength),
+        "x-appscreen-crc": String(crc),
+        "x-appscreen-width": "1320",
+        "x-appscreen-height": "2868",
+        "x-appscreen-sha256": sha256,
+        "x-appscreen-index": String(index),
+      },
+      body: new Blob([png], { type: "image/png" }),
+    }), e);
+    if (response.status !== 200) throw new Error(await response.text());
+    frames.push({ index, token, width: 1320, height: 2868, bytes: png.byteLength, sha256, crc });
+  }
+  return frames;
+}
+
 async function rpc(e: Env, method: string, params: Record<string, unknown> = {}, id = 1, token = TOKEN) {
-  const response = await route(mcp({ jsonrpc: "2.0", id, method, params }, token), e, async (_url, indices) => {
-    return indices.map((index): RenderShot => ({
-      index,
-      png: new Uint8Array([137, 80, 78, 71, index]),
-      width: 1320,
-      height: 2868,
-    }));
+  const response = await route(mcp({ jsonrpc: "2.0", id, method, params }, token), e, async (pageUrl, indices) => {
+    return pageUpload(e, pageUrl, indices, (index) => new Uint8Array([137, 80, 78, 71, index]));
   });
   const json = await response.json() as { result?: { content?: { type: string; text?: string; data?: string }[]; isError?: boolean }; error?: { message: string } };
   return { status: response.status, json };
@@ -194,7 +223,8 @@ describe("mcp tools", () => {
     });
     const previewData = toolData(preview.json);
     assert.match(String(previewData.url), /\/f\/[a-f0-9]+\/screenshot-1\.png$/);
-    assert.equal(preview.json.result?.content?.[1].type, "image");
+    assert.equal(preview.json.result?.content?.[1], undefined);
+    assert.match(String(previewData.inline_omitted), /does not copy image bytes/);
 
     const fileUrl = new URL(String(previewData.url));
     const file = await route(new Request(fileUrl), e);
@@ -206,6 +236,13 @@ describe("mcp tools", () => {
     const exported = toolData(await rpc(e, "tools/call", { name: "export_project", arguments: { project_id: id } }));
     assert.equal((exported.pngs as unknown[]).length, 1);
     assert.match(String(exported.zip_url), /screenshots\.zip$/);
+    const zipResponse = await route(new Request(String(exported.zip_url)), e);
+    assert.equal(zipResponse.status, 200);
+    assert.equal(zipResponse.headers.get("content-type"), "application/zip");
+    const zipBytes = new Uint8Array(await zipResponse.arrayBuffer());
+    assert.equal(zipBytes[0], 0x50);
+    assert.equal(zipBytes[1], 0x4b);
+    assert.equal(zipBytes.byteLength, Number(zipResponse.headers.get("content-length")));
 
     const live = await route(new Request(`https://homebooks-appscreen-mcp.matinrahimi.workers.dev/api/projects/${id}`, {
       headers: { "X-Edit-Key": editKey },
@@ -345,6 +382,7 @@ describe("mcp tools", () => {
     assert.equal(gate.type, "durable_object_namespace");
     assert.equal(gate.class_name, "ProjectGate");
     assert.equal(metadata.migrations, undefined);
+    assert.equal(metadata.observability.enabled, true);
   });
 
   it("refuses an export whose captures are identical for different images", async () => {
@@ -355,21 +393,24 @@ describe("mcp tools", () => {
     const second = Buffer.from([137, 80, 78, 71, 2]).toString("base64");
     toolData(await rpc(e, "tools/call", { name: "add_screenshot", arguments: { project_id: id, image_base64: first, name: "one.png" } }));
     toolData(await rpc(e, "tools/call", { name: "add_screenshot", arguments: { project_id: id, image_base64: second, name: "two.png" } }));
-    let supplied = "";
     const response = await route(mcp({
       jsonrpc: "2.0",
       id: 1,
       method: "tools/call",
       params: { name: "export_project", arguments: { project_id: id } },
-    }), e, async (_url, indices, supply) => {
-      supplied = supply?.projectBody || "";
-      const png = new Uint8Array([137, 80, 78, 71, 9]);
-      return indices.map((index) => ({ index, png, width: 10, height: 10 }));
+    }), e, async (pageUrl, indices, supply?: unknown) => {
+      assert.equal(supply, undefined);
+      assert.equal(pageUrl.includes("data:image"), false);
+      assert.match(pageUrl, /uploads=/);
+      const uploads = new URL(pageUrl).searchParams.get("uploads") || "";
+      const sha256 = "11".repeat(32);
+      return indices.map((index) => {
+        const token = uploads.split(",").find((part) => part.startsWith(`${index}:`))?.split(":")[1] || "";
+        return { index, token, width: 8, height: 8, bytes: 4, sha256, crc: 1 };
+      });
     });
     const json = await response.json() as { result?: { isError?: boolean; content?: { text?: string }[] } };
     assert.equal(json.result?.isError, true);
     assert.match(json.result?.content?.[0].text || "", /byte-identical/);
-    assert.match(supplied, /data:image\/png;base64,/);
-    assert.equal(supplied.includes("/assets/"), false);
   });
 });

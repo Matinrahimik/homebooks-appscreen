@@ -42,4 +42,31 @@ describe("render readiness", () => {
     assert.equal(ready.assetLabel(shot.localizedImages.en.src), "asset " + "cd".repeat(32));
     assert.equal(ready.screenshotSource({ src: "legacy" }, "en"), "legacy");
   });
+
+  it("retries a failed asset a few times and names the hash", () => {
+    const hash = "ab".repeat(32);
+    const failed = { complete: true, naturalWidth: 0, src: "https://worker.test/assets/" + hash + "?cb=1" };
+    const first = ready.nextImageAttempt(failed, "Screenshot 0", 1, ready.IMAGE_LOAD_ATTEMPTS);
+    assert.equal(first.action, "retry");
+    assert.match(first.message, new RegExp(hash));
+    const last = ready.nextImageAttempt(failed, "Screenshot 0", ready.IMAGE_LOAD_ATTEMPTS, ready.IMAGE_LOAD_ATTEMPTS);
+    assert.equal(last.action, "fail");
+    assert.match(last.message, /failed to load/);
+    assert.equal(ready.nextImageAttempt({ complete: false, naturalWidth: 0, src: failed.src }, "Screenshot 0", 1, 3).action, "wait");
+    assert.equal(ready.nextImageAttempt({ complete: true, naturalWidth: 20, src: failed.src }, "Screenshot 0", 1, 3).action, "ok");
+    assert.equal(
+      ready.assetRetryUrl(failed.src, 2, 99),
+      "https://worker.test/assets/" + hash + "?retry=2&t=99",
+    );
+    const slots = ready.parseUploads("0:" + "cd".repeat(32) + ",1:nope");
+    assert.equal(slots[0], "cd".repeat(32));
+    assert.equal(slots[1], undefined);
+    const crc = ready.crc32(new TextEncoder().encode("123456789"));
+    assert.equal(crc, 0xcbf43926);
+  });
+
+  it("hashes the bytes the page will upload", async () => {
+    const sha = await ready.sha256Hex(new TextEncoder().encode("abc"));
+    assert.equal(sha, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  });
 });

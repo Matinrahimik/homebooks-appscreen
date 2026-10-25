@@ -4,8 +4,9 @@
  * ?project=<id>&key=<editKey> loads the Worker backup JSON (the same shape as
  * Export/Import Project Backup) and debounced-saves edits back.
  * Optional &api=<origin> overrides the Worker origin.
- * &render=<index|all> hides the chrome and exposes window.__appscreen so a
- * headless browser can read the canvas at the real output pixel size.
+ * &render=<index|all> hides the chrome. &uploads=<index:token,...> tells render
+ * mode to encode each canvas with toBlob and PUT it to the Worker. The headless
+ * browser only watches for status "done".
  *
  * Without those parameters this file does not change editor behaviour.
  */
@@ -68,14 +69,27 @@
     }
 
     function markError(message) {
+        window.__appscreenFinished = true;
         window.__appscreenError = message;
         document.documentElement.dataset.appscreenStatus = 'error';
         document.documentElement.dataset.appscreenError = message;
     }
 
     function markReady() {
+        window.__appscreenFinished = true;
         window.__appscreenReady = true;
         document.documentElement.dataset.appscreenStatus = 'ready';
+        if (typeof canvas !== 'undefined' && canvas) {
+            document.documentElement.dataset.appscreenWidth = String(canvas.width);
+            document.documentElement.dataset.appscreenHeight = String(canvas.height);
+        }
+    }
+
+    function markDone(shots) {
+        window.__appscreenFinished = true;
+        window.__appscreenResult = { shots: shots };
+        document.documentElement.dataset.appscreenStatus = 'done';
+        document.documentElement.dataset.appscreenResult = JSON.stringify({ shots: shots });
         if (typeof canvas !== 'undefined' && canvas) {
             document.documentElement.dataset.appscreenWidth = String(canvas.width);
             document.documentElement.dataset.appscreenHeight = String(canvas.height);
@@ -326,34 +340,72 @@
         throw new Error('Screenshots did not finish loading');
     }
 
+    function reloadImage(img, src) {
+        return new Promise(function (resolve) {
+            var timer = setTimeout(finish, 10000);
+            function finish() {
+                clearTimeout(timer);
+                img.removeEventListener('load', finish);
+                img.removeEventListener('error', finish);
+                resolve();
+            }
+            try { img.removeAttribute('src'); } catch (e) { /* ignore */ }
+            img.addEventListener('load', finish);
+            img.addEventListener('error', finish);
+            try { img.crossOrigin = 'anonymous'; } catch (e2) { /* ignore */ }
+            img.src = src;
+        });
+    }
+
     async function waitImage(img, label) {
-        var deadline = Date.now() + 60000;
         var api = readyApi();
-        while (Date.now() < deadline) {
-            var status = api
-                ? api.imageState(img, label)
-                : (img && img.complete && img.naturalWidth > 0
-                    ? { state: 'ok', message: '' }
-                    : (img && img.complete ? { state: 'error', message: label + ' failed to load' } : { state: 'pending', message: '' }));
-            if (status.state === 'error') throw new Error(status.message);
-            if (status.state === 'ok') {
-                if (img.decode) {
-                    try {
-                        await img.decode();
-                    } catch (e) {
-                        var src = img.currentSrc || img.src || '';
-                        var named = api ? api.assetLabel(src) : src;
-                        throw new Error(label + ' (' + named + ') failed to decode');
-                    }
+        var attempts = api && api.IMAGE_LOAD_ATTEMPTS ? api.IMAGE_LOAD_ATTEMPTS : 3;
+        var lastMessage = label + ' failed to load';
+        for (var attempt = 1; attempt <= attempts; attempt++) {
+            var deadline = Date.now() + 10000;
+            var retrySrc = '';
+            while (Date.now() < deadline) {
+                var decision = api
+                    ? api.nextImageAttempt(img, label, attempt, attempts)
+                    : { action: 'fail', message: lastMessage };
+                if (decision.action === 'wait') {
+                    await sleep(40);
+                    continue;
                 }
-                if (!(img.naturalWidth > 0)) throw new Error(label + ' failed to decode');
+                if (decision.action === 'fail') throw new Error(decision.message);
+                if (decision.action === 'retry') {
+                    lastMessage = decision.message;
+                    var current = (img && (img.currentSrc || img.src)) || '';
+                    retrySrc = api.assetRetryUrl(current, attempt + 1, Date.now());
+                    break;
+                }
+                try {
+                    if (img.decode) await img.decode();
+                } catch (e) {
+                    var src = (img && (img.currentSrc || img.src)) || '';
+                    var named = api ? api.assetLabel(src) : src;
+                    lastMessage = label + ' (' + named + ') failed to decode';
+                    if (attempt >= attempts) throw new Error(lastMessage);
+                    retrySrc = api.assetRetryUrl(src, attempt + 1, Date.now());
+                    break;
+                }
+                if (!(img.naturalWidth > 0)) {
+                    var decodedSrc = (img && (img.currentSrc || img.src)) || '';
+                    var decodedName = api ? api.assetLabel(decodedSrc) : decodedSrc;
+                    throw new Error(label + ' (' + decodedName + ') failed to decode');
+                }
                 return;
             }
-            await sleep(40);
+            if (!retrySrc) {
+                var lateSrc = (img && (img.currentSrc || img.src)) || '';
+                var lateName = api ? api.assetLabel(lateSrc) : (lateSrc || 'image');
+                lastMessage = label + ' (' + lateName + ') did not load in time';
+                if (attempt >= attempts) throw new Error(lastMessage);
+                retrySrc = api ? api.assetRetryUrl(lateSrc, attempt + 1, Date.now()) : lateSrc;
+            }
+            if (retrySrc) await reloadImage(img, retrySrc);
         }
-        var lateSrc = img && (img.currentSrc || img.src) || '';
-        var lateName = api ? api.assetLabel(lateSrc) : (lateSrc || 'image');
-        throw new Error(label + ' (' + lateName + ') did not load in time');
+        throw new Error(lastMessage);
     }
 
     function frameImages(index) {
@@ -491,12 +543,104 @@
         return shots;
     }
 
+    function uploadSlots() {
+        var api = readyApi();
+        if (!api || !api.parseUploads) return {};
+        return api.parseUploads(params.get('uploads'));
+    }
+
+    function indexesToRender() {
+        if (renderTarget === 'all') {
+            var list = [];
+            for (var i = 0; i < (state.screenshots || []).length; i++) list.push(i);
+            return list;
+        }
+        if (typeof renderTarget === 'number') return [renderTarget];
+        return [state.selectedIndex || 0];
+    }
+
+    async function uploadIndex(index) {
+        var api = readyApi();
+        var token = uploadSlots()[index];
+        if (!token) throw new Error('Screenshot ' + index + ' has no upload token');
+        var canvasEl = (typeof canvas !== 'undefined' && canvas) ? canvas : document.getElementById('preview-canvas');
+        if (!canvasEl || !canvasEl.toBlob) throw new Error('Preview canvas is missing');
+        var blob = await new Promise(function (resolve, reject) {
+            canvasEl.toBlob(function (value) {
+                if (!value) reject(new Error('Screenshot ' + index + ' did not encode a PNG'));
+                else resolve(value);
+            }, 'image/png');
+        });
+        var bytes = new Uint8Array(await blob.arrayBuffer());
+        if (!bytes.byteLength) throw new Error('Screenshot ' + index + ' encoded an empty PNG');
+        var sum = api.crc32(bytes);
+        var sha = await api.sha256Hex(bytes);
+        var headers = {
+            'Content-Type': 'image/png',
+            'X-Appscreen-Crc': String(sum),
+            'X-Appscreen-Width': String(canvasEl.width),
+            'X-Appscreen-Height': String(canvasEl.height),
+            'X-Appscreen-Sha256': sha,
+            'X-Appscreen-Index': String(index)
+        };
+        var lastError = null;
+        for (var attempt = 1; attempt <= 3; attempt++) {
+            try {
+                var response = await fetch(apiBase + '/renders/' + token, {
+                    method: 'PUT',
+                    headers: headers,
+                    body: new Blob([bytes], { type: 'image/png' }),
+                    cache: 'no-store'
+                });
+                if (!response.ok) {
+                    var detail = '';
+                    try { detail = (await response.text()).slice(0, 180); } catch (e) { detail = ''; }
+                    var failed = new Error('Screenshot ' + index + ' upload failed with HTTP ' + response.status + (detail ? ' ' + detail : ''));
+                    if (response.status === 400 || response.status === 401 || response.status === 404 || response.status === 413) throw failed;
+                    lastError = failed;
+                } else {
+                    var payload = await response.json();
+                    if (!payload || payload.ok !== true) throw new Error('Screenshot ' + index + ' upload was not stored');
+                    return {
+                        index: index,
+                        token: token,
+                        width: canvasEl.width,
+                        height: canvasEl.height,
+                        bytes: bytes.byteLength,
+                        sha256: sha,
+                        crc: sum
+                    };
+                }
+            } catch (error) {
+                if (error && /HTTP (400|401|404|413)/.test(String(error.message || ''))) throw error;
+                lastError = error;
+            }
+            if (attempt < 3) await sleep(200 * attempt);
+        }
+        throw lastError || new Error('Screenshot ' + index + ' upload failed');
+    }
+
+    async function renderAndUpload() {
+        if (params.get('uploads') && !readyApi()) throw new Error('Render helpers did not load');
+        var uploading = Object.keys(uploadSlots()).length > 0;
+        if (params.get('uploads') && !uploading) throw new Error('Upload tokens were not understood');
+        await waitForScreenshots();
+        var indexes = indexesToRender();
+        if (live && indexes.length === 0) throw new Error('Project has no screenshots to render');
+        var shots = [];
+        for (var n = 0; n < indexes.length; n++) {
+            await paintIndex(indexes[n]);
+            if (uploading) shots.push(await uploadIndex(indexes[n]));
+        }
+        if (uploading) markDone(shots);
+        else markReady();
+    }
+
     function afterRender() {
-        if (!isRenderMode() || checking || pullFailed || window.__appscreenReady) return;
+        if (!isRenderMode() || checking || pullFailed || window.__appscreenFinished) return;
         checking = true;
-        prepareFrame().then(function () {
+        renderAndUpload().then(function () {
             checking = false;
-            markReady();
         }).catch(function (error) {
             checking = false;
             console.error(error);

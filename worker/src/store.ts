@@ -1,6 +1,7 @@
 import { externalizeValue, replaceDataUrls } from "./assets.ts";
 import { memoryProjectGate, ProjectGate } from "./gate.ts";
 import { deleteBlob, getBytes, getText, putBytes } from "./kvblob.ts";
+import { storeZipByteLength } from "./zip.ts";
 import { assertBackup, clone, primaryProject, ProjectError, projectName, type BackupDump } from "./project.ts";
 import type { Env, KvLike } from "./types.ts";
 
@@ -36,8 +37,54 @@ const INDEX_KEY = "idx:projects";
 function projectKey(id: string): string {
   return `proj:${id}`;
 }
-function fileKey(token: string): string {
+export function publicFileKey(token: string): string {
   return `file:${token}`;
+}
+function fileKey(token: string): string {
+  return publicFileKey(token);
+}
+
+export interface RenderTokenRecord {
+  projectId: string;
+  index: number;
+  filename: string;
+  uploaded: boolean;
+  bytes?: number;
+  width?: number;
+  height?: number;
+  sha256?: string;
+  crc?: number;
+}
+
+export function renderTokenKey(token: string): string {
+  return `rendertoken:${token}`;
+}
+
+export async function readRenderToken(kv: KvLike, token: string): Promise<RenderTokenRecord | null> {
+  const raw = await kv.get(renderTokenKey(token), { type: "text" });
+  if (typeof raw !== "string" || !raw) return null;
+  return JSON.parse(raw) as RenderTokenRecord;
+}
+
+export async function writeRenderToken(kv: KvLike, token: string, record: RenderTokenRecord): Promise<void> {
+  await kv.put(renderTokenKey(token), JSON.stringify(record));
+}
+
+export async function putStoreZip(
+  kv: KvLike,
+  token: string,
+  files: { name: string; key: string; crc: number; size: number }[],
+  when = "2020-01-01T00:00:00.000Z",
+): Promise<void> {
+  const meta = {
+    chunks: 0,
+    size: storeZipByteLength(files),
+    encoding: "store-zip",
+    contentType: "application/zip",
+    files,
+    when,
+  };
+  await kv.put(`${publicFileKey(token)}:meta`, JSON.stringify(meta));
 }
 function docKey(id: string): string {
   return `proj:${id}:doc`;
