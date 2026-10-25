@@ -1,0 +1,48 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Assemble static site
+        run: |
+          mkdir -p _site
+          cp index.html styles.css app.js three-renderer.js language-utils.js \
+             llm.js magical-titles.js lucide-icons.js live-sync.js backup-state.js .nojekyll _site/
+          cp -R img models _site/
+          # Project Pages serves this repo at /homebooks-appscreen/. Relative
+          # asset URLs plus the base-path script in index.html resolve models
+          # and images under that subpath.
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

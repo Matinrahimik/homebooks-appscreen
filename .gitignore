@@ -10,9 +10,9 @@
 # Node
 node_modules/
 
-# Build output
-dist/
-out/
+# Build output (root only — worker/dist/worker.js is a committed deploy artifact)
+/dist/
+/out/
 
 # Tauri
 src-tauri/target/

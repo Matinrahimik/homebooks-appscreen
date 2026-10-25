@@ -1,0 +1,17 @@
+{
+  "name": "homebooks-appscreen-mcp",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Remote MCP server and live-project API for the HomeBooks App Store screenshot designer.",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^1.0.6"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.10"
+  }
+}

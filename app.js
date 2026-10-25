@@ -21,8 +21,12 @@ const state = {
             },
             solid: '#1a1a2e',
             image: null,
+            imageSrc: '',
             imageFit: 'cover',
             imageBlur: 0,
+            imageOffsetX: 0,
+            imageOffsetY: 0,
+            imageScale: 100,
             overlayColor: '#000000',
             overlayOpacity: 0,
             noise: false,
@@ -79,6 +83,10 @@ const state = {
             position: 'top',
             offsetY: 12,
             lineHeight: 110,
+            textGap: 10,
+            textGapUnit: 'px',
+            headlineLetterSpacing: 0,
+            subheadlineLetterSpacing: 0,
             subheadlineEnabled: false,
             subheadlines: { en: '' },
             subheadlineLanguages: ['en'],
@@ -94,6 +102,14 @@ const state = {
         },
         elements: [],
         popouts: []
+    },
+    panoramicBackground: {
+        enabled: false,
+        src: '',
+        image: null,
+        overlap: 0,
+        scale: 100,
+        offsetY: 0
     }
 };
 
@@ -579,10 +595,136 @@ function setTextSetting(key, value) {
     }
 }
 
+function attachBackgroundImage(bg) {
+    if (!bg) return bg;
+    if (!bg.imageSrc && typeof bg.image === 'string') bg.imageSrc = bg.image;
+    const src = bg.imageSrc || (bg.image && bg.image.src) || '';
+    if (src && !(bg.image instanceof HTMLImageElement && bg.image.src === src)) {
+        bg.imageSrc = src;
+        const img = new Image();
+        img.onload = () => {
+            if (typeof updateCanvas === 'function') updateCanvas();
+        };
+        img.src = src;
+        bg.image = img;
+    } else if (!src) {
+        bg.image = bg.image instanceof HTMLImageElement ? bg.image : null;
+        bg.imageSrc = '';
+    }
+    if (bg.imageOffsetX == null) bg.imageOffsetX = 0;
+    if (bg.imageOffsetY == null) bg.imageOffsetY = 0;
+    if (bg.imageScale == null) bg.imageScale = 100;
+    return bg;
+}
+
+function attachPanoramicImage(pano) {
+    const source = pano || {};
+    const next = {
+        enabled: !!source.enabled,
+        src: source.src || '',
+        image: source.image instanceof HTMLImageElement ? source.image : null,
+        overlap: typeof source.overlap === 'number' ? source.overlap : 0,
+        scale: typeof source.scale === 'number' ? source.scale : 100,
+        offsetY: typeof source.offsetY === 'number' ? source.offsetY : 0
+    };
+    if (next.src && !(next.image && next.image.src === next.src)) {
+        const img = new Image();
+        img.onload = () => {
+            if (typeof updateCanvas === 'function') updateCanvas();
+        };
+        img.src = next.src;
+        next.image = img;
+    }
+    return next;
+}
+
+function copyBackgroundSettings(sourceBg) {
+    const serialized = window.BackupState
+        ? BackupState.serializeBackground(sourceBg)
+        : JSON.parse(JSON.stringify(sourceBg || {}));
+    const copy = JSON.parse(JSON.stringify(serialized));
+    return attachBackgroundImage(copy);
+}
+
+function syncTextSpacingControls(text) {
+    if (!text) return;
+    const textGap = typeof text.textGap === 'number' ? text.textGap : 10;
+    const textGapUnit = text.textGapUnit === 'percent' ? 'percent' : 'px';
+    setSliderValue('text-gap', textGap);
+    const textGapValue = document.getElementById('text-gap-value');
+    if (textGapValue) textGapValue.textContent = formatValue(textGap) + (textGapUnit === 'percent' ? '%' : 'px');
+    const textGapUnitEl = document.getElementById('text-gap-unit');
+    if (textGapUnitEl) textGapUnitEl.value = textGapUnit;
+    setSliderValue('headline-letter-spacing', text.headlineLetterSpacing || 0);
+    const headlineTracking = document.getElementById('headline-letter-spacing-value');
+    if (headlineTracking) headlineTracking.textContent = formatValue(text.headlineLetterSpacing || 0) + 'px';
+    setSliderValue('subheadline-letter-spacing', text.subheadlineLetterSpacing || 0);
+    const subTracking = document.getElementById('subheadline-letter-spacing-value');
+    if (subTracking) subTracking.textContent = formatValue(text.subheadlineLetterSpacing || 0) + 'px';
+}
+
+function setSliderValue(id, value) {
+    const el = document.getElementById(id);
+    if (!el || value == null || Number.isNaN(Number(value))) return;
+    const n = Number(value);
+    if (el.max !== '' && n > Number(el.max)) el.max = String(n);
+    if (el.min !== '' && n < Number(el.min)) el.min = String(n);
+    el.value = String(n);
+}
+
+function flushControlsIntoState() {
+    const read = (id) => {
+        const el = document.getElementById(id);
+        if (!el || el.value === '') return null;
+        const n = parseFloat(el.value);
+        return Number.isNaN(n) ? null : n;
+    };
+    const apply = (id, setter) => {
+        const n = read(id);
+        if (n == null) return;
+        setter(n);
+    };
+    apply('gradient-angle', (n) => setBackground('gradient.angle', n));
+    apply('bg-blur', (n) => setBackground('imageBlur', n));
+    apply('bg-overlay-opacity', (n) => setBackground('overlayOpacity', n));
+    apply('noise-intensity', (n) => setBackground('noiseIntensity', n));
+    apply('bg-image-offset-x', (n) => setBackground('imageOffsetX', n));
+    apply('bg-image-offset-y', (n) => setBackground('imageOffsetY', n));
+    apply('bg-image-scale', (n) => setBackground('imageScale', n));
+    apply('screenshot-scale', (n) => setScreenshotSetting('scale', n));
+    apply('screenshot-y', (n) => setScreenshotSetting('y', n));
+    apply('screenshot-x', (n) => setScreenshotSetting('x', n));
+    apply('corner-radius', (n) => setScreenshotSetting('cornerRadius', n));
+    apply('screenshot-rotation', (n) => setScreenshotSetting('rotation', n));
+    apply('rotation-3d-x', (n) => setScreenshotSetting('rotation3D.x', n));
+    apply('rotation-3d-y', (n) => setScreenshotSetting('rotation3D.y', n));
+    apply('rotation-3d-z', (n) => setScreenshotSetting('rotation3D.z', n));
+    apply('shadow-blur', (n) => setScreenshotSetting('shadow.blur', n));
+    apply('shadow-opacity', (n) => setScreenshotSetting('shadow.opacity', n));
+    apply('shadow-x', (n) => setScreenshotSetting('shadow.x', n));
+    apply('shadow-y', (n) => setScreenshotSetting('shadow.y', n));
+    apply('frame-width', (n) => setScreenshotSetting('frame.width', n));
+    apply('frame-opacity', (n) => setScreenshotSetting('frame.opacity', n));
+    apply('text-offset-y', (n) => setTextLanguageValue('offsetY', n));
+    apply('line-height', (n) => setTextLanguageValue('lineHeight', n));
+    apply('text-gap', (n) => setTextSetting('textGap', n));
+    apply('headline-letter-spacing', (n) => setTextSetting('headlineLetterSpacing', n));
+    apply('subheadline-letter-spacing', (n) => setTextSetting('subheadlineLetterSpacing', n));
+    const gapUnit = document.getElementById('text-gap-unit');
+    if (gapUnit && gapUnit.value) setTextSetting('textGapUnit', gapUnit.value);
+    const pano = state.panoramicBackground || (state.panoramicBackground = {});
+    const overlap = read('panoramic-overlap');
+    if (overlap != null) pano.overlap = overlap / 100;
+    const panoScale = read('panoramic-scale');
+    if (panoScale != null) pano.scale = panoScale;
+    const panoY = read('panoramic-offset-y');
+    if (panoY != null) pano.offsetY = panoY;
+}
+
 function setCurrentScreenshotAsDefault() {
     const screenshot = getCurrentScreenshot();
     if (screenshot) {
-        state.defaults.background = JSON.parse(JSON.stringify(screenshot.background));
+        state.defaults.background = copyBackgroundSettings(screenshot.background);
         state.defaults.screenshot = JSON.parse(JSON.stringify(screenshot.screenshot));
         state.defaults.text = JSON.parse(JSON.stringify(screenshot.text));
     }
@@ -642,66 +784,136 @@ const googleFonts = {
     allFonts: null
 };
 
-// Load a Google Font dynamically
-async function loadGoogleFont(fontName) {
-    // Check if it's a system font
-    const isSystem = googleFonts.system.some(f => f.name === fontName);
-    if (isSystem) return;
+const fontLoadPromises = new Map();
 
-    // If already loaded, just ensure the current weight is available
-    if (googleFonts.loaded.has(fontName)) {
-        const text = getTextSettings();
-        const weight = text.headlineWeight || '600';
+function googleFamilyName(fontName) {
+    if (!fontName) return '';
+    const text = String(fontName).trim();
+    if (googleFonts.system.some(f => f.name === text || f.value === text)) return '';
+    const quoted = text.match(/'([^']+)'|"([^"]+)"/);
+    const candidate = quoted ? (quoted[1] || quoted[2]) : text.split(',')[0].replace(/['"]/g, '').trim();
+    if (!candidate) return '';
+    const generic = ['sans-serif', 'serif', 'monospace', 'system-ui', 'cursive', 'fantasy', 'emoji'];
+    if (generic.includes(candidate.toLowerCase())) return '';
+    if (googleFonts.system.some(f => f.name === candidate)) return '';
+    if (candidate.includes('-apple-system') || candidate.includes('BlinkMacSystemFont')) return '';
+    return candidate;
+}
+
+function parseGoogleFontFaces(css) {
+    return css.split('@font-face').slice(1).map((block) => {
+        const family = (block.match(/font-family:\s*['"]?([^;'"]+)/) || [])[1];
+        const weight = (block.match(/font-weight:\s*(\d+)/) || [])[1] || '400';
+        const style = (block.match(/font-style:\s*(\w+)/) || [])[1] || 'normal';
+        const url = (block.match(/url\(([^)]+)\)/) || [])[1];
+        const unicode = (block.match(/unicode-range:\s*([^;]+)/) || [])[1];
+        if (!family || !url) return null;
+        return {
+            family: family.trim().replace(/['"]/g, ''),
+            weight,
+            style,
+            url: url.trim().replace(/['"]/g, ''),
+            unicodeRange: unicode ? unicode.trim() : undefined
+        };
+    }).filter(Boolean);
+}
+
+// Load any Google Font family and wait until document.fonts can paint it.
+async function loadGoogleFont(fontName, weights) {
+    const family = googleFamilyName(fontName);
+    if (!family) return;
+
+    const weightList = [...new Set((weights && weights.length ? weights : ['400', '500', '600', '700']).map(w => String(w)))];
+    const key = `${family}:${weightList.slice().sort().join(',')}`;
+    if (fontLoadPromises.has(key)) {
+        await fontLoadPromises.get(key);
+        return;
+    }
+
+    const pending = (async () => {
+        googleFonts.loading.add(family);
+        const cssHref = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(family)}:wght@${weightList.join(';')}&display=swap`;
         try {
-            await document.fonts.load(`${weight} 16px "${fontName}"`);
-        } catch (e) {
-            // Font already loaded, weight might not exist but that's ok
-        }
-        return;
-    }
+            if (!document.querySelector(`link[data-appscreen-font="${CSS.escape(family)}"]`)) {
+                const link = document.createElement('link');
+                link.rel = 'stylesheet';
+                link.href = cssHref;
+                link.dataset.appscreenFont = family;
+                const loaded = new Promise((resolve) => {
+                    link.onload = resolve;
+                    link.onerror = resolve;
+                });
+                document.head.appendChild(link);
+                await loaded;
+            }
 
-    // If currently loading, wait for it
-    if (googleFonts.loading.has(fontName)) {
-        // Wait a bit and check again
-        await new Promise(resolve => setTimeout(resolve, 100));
-        if (googleFonts.loading.has(fontName)) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-        return;
-    }
+            let faces = [];
+            try {
+                const response = await fetch(cssHref);
+                if (response.ok) faces = parseGoogleFontFaces(await response.text());
+            } catch (e) {
+                faces = [];
+            }
 
-    googleFonts.loading.add(fontName);
+            if (faces.length && typeof FontFace !== 'undefined') {
+                await Promise.all(faces.map(async (spec) => {
+                    try {
+                        const face = new FontFace(spec.family, `url(${spec.url})`, {
+                            weight: spec.weight,
+                            style: spec.style,
+                            unicodeRange: spec.unicodeRange,
+                            display: 'swap'
+                        });
+                        await face.load();
+                        document.fonts.add(face);
+                    } catch (e) {
+                        /* a subset file can fail without blocking the family */
+                    }
+                }));
+            }
+
+            if (document.fonts && document.fonts.load) {
+                await Promise.all(weightList.map((weight) => document.fonts.load(`${weight} 64px "${family}"`)));
+            }
+            if (document.fonts && document.fonts.ready) await document.fonts.ready;
+            googleFonts.loaded.add(family);
+        } catch (error) {
+            console.warn(`Failed to load font: ${family}`, error);
+        } finally {
+            googleFonts.loading.delete(family);
+        }
+    })();
+
+    fontLoadPromises.set(key, pending);
+    await pending;
 
     try {
-        const link = document.createElement('link');
-        link.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(fontName)}:wght@300;400;500;600;700;800;900&display=swap`;
-        link.rel = 'stylesheet';
-
-        // Wait for stylesheet to load first
-        await new Promise((resolve, reject) => {
-            link.onload = resolve;
-            link.onerror = reject;
-            document.head.appendChild(link);
-        });
-
-        // Wait for the font to actually load with the required weights
-        const text = getTextSettings();
-        const headlineWeight = text.headlineWeight || '600';
-        const subheadlineWeight = text.subheadlineWeight || '400';
-
-        // Load all weights we might need
-        await Promise.all([
-            document.fonts.load(`400 16px "${fontName}"`),
-            document.fonts.load(`${headlineWeight} 16px "${fontName}"`),
-            document.fonts.load(`${subheadlineWeight} 16px "${fontName}"`)
-        ]);
-
-        googleFonts.loaded.add(fontName);
-        googleFonts.loading.delete(fontName);
-    } catch (error) {
-        console.warn(`Failed to load font: ${fontName}`, error);
-        googleFonts.loading.delete(fontName);
+        const text = typeof getTextSettings === 'function' ? getTextSettings() : null;
+        const used = text ? `${text.headlineFont || ''} ${text.subheadlineFont || ''}` : '';
+        if (used.includes(family) && typeof updateCanvas === 'function') updateCanvas();
+    } catch (e) {
+        /* canvas may not be ready during startup */
     }
+}
+
+function currentFontWeights() {
+    try {
+        const text = getTextSettings();
+        return [text.headlineWeight || '600', text.subheadlineWeight || '400', '400', '700'];
+    } catch (e) {
+        return ['400', '600', '700'];
+    }
+}
+
+async function ensureProjectFonts() {
+    const text = typeof getTextSettings === 'function' ? getTextSettings() : null;
+    if (!text) return;
+    const weights = [text.headlineWeight || '600', text.subheadlineWeight || '400'];
+    const families = [text.headlineFont, text.subheadlineFont].map(googleFamilyName).filter(Boolean);
+    for (const family of families) {
+        await loadGoogleFont(family, weights);
+    }
+    if (document.fonts && document.fonts.ready) await document.fonts.ready;
 }
 
 // Fetch all Google Fonts from the API (cached)
@@ -1025,10 +1237,30 @@ function initSingleFontPicker(pickerId, ids) {
         }
     });
 
-    // Search input
+    // Search input. Any Google Fonts family can be chosen by name, not only the cached list.
     searchInput.addEventListener('input', (e) => {
         fontPickerState[pickerId].search = e.target.value.toLowerCase();
+        fontPickerState[pickerId].searchRaw = e.target.value;
         renderFontList(pickerId, ids);
+    });
+    searchInput.addEventListener('keydown', async (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        const raw = (fontPickerState[pickerId].searchRaw || searchInput.value || '').trim().replace(/["<>]/g, '');
+        if (!raw) return;
+        const family = raw.replace(/\s+/g, ' ');
+        const fontValue = `'${family.replace(/'/g, '')}', sans-serif`;
+        await loadGoogleFont(family, currentFontWeights());
+        document.getElementById(ids.hidden).value = fontValue;
+        if (ids.setFont) ids.setFont(fontValue);
+        else setTextValue(ids.stateKey, fontValue);
+        const preview = document.getElementById(ids.preview);
+        if (preview) {
+            preview.textContent = family;
+            preview.style.fontFamily = fontValue;
+        }
+        dropdown.classList.remove('open');
+        updateCanvas();
     });
 
     // Prevent dropdown close when clicking inside
@@ -1092,6 +1324,15 @@ async function renderFontList(pickerId, ids) {
     // Filter by search
     if (pickerState.search) {
         fonts = fonts.filter(f => f.name.toLowerCase().includes(pickerState.search));
+        const raw = (pickerState.searchRaw || pickerState.search).trim().replace(/["<>]/g, '').replace(/\s+/g, ' ');
+        const exact = fonts.some(f => f.name.toLowerCase() === raw.toLowerCase());
+        if (raw && !exact) {
+            fonts.unshift({
+                name: raw,
+                value: `'${raw.replace(/'/g, '')}', sans-serif`,
+                category: 'google'
+            });
+        }
     }
 
     // Limit to prevent performance issues
@@ -1130,7 +1371,7 @@ async function renderFontList(pickerId, ids) {
             if (fontCategory === 'google') {
                 option.querySelector('.font-option-category').textContent = 'Loading...';
                 option.querySelector('.font-option-category').classList.add('font-option-loading');
-                await loadGoogleFont(fontName);
+                await loadGoogleFont(fontName, currentFontWeights());
                 option.querySelector('.font-option-name').style.fontFamily = fontValue;
                 option.querySelector('.font-option-category').textContent = 'google';
                 option.querySelector('.font-option-category').classList.remove('font-option-loading');
@@ -1327,6 +1568,7 @@ const META_STORE = 'meta';
 
 let currentProjectId = 'default';
 let projects = [{ id: 'default', name: 'Default Project', screenshotCount: 0 }];
+let persistEnabled = false;
 
 function openDatabase() {
     return new Promise((resolve, reject) => {
@@ -1460,13 +1702,25 @@ function updateProjectSelector() {
 async function init() {
     try {
         await openDatabase();
+        if (window.AppscreenLive && AppscreenLive.isLive()) {
+            await AppscreenLive.pull(db);
+        }
         await loadProjectsMeta();
         await loadState();
+        if (window.AppscreenLive && AppscreenLive.isRenderMode()) {
+            const renderTarget = AppscreenLive.renderTarget();
+            if (typeof renderTarget === 'number' && state.screenshots[renderTarget]) {
+                state.selectedIndex = renderTarget;
+            }
+        }
         syncUIWithState();
+        persistEnabled = true;
         updateCanvas();
+        if (window.AppscreenLive) AppscreenLive.finishHydration();
     } catch (e) {
         console.error('Initialization error:', e);
         // Continue with defaults
+        persistEnabled = true;
         syncUIWithState();
         updateCanvas();
     }
@@ -1485,11 +1739,7 @@ function initSync() {
     init();
 }
 
-// Save state to IndexedDB for current project
-function saveState() {
-    if (!db) return;
-
-    // Convert screenshots to base64 for storage, including per-screenshot settings and localized images
+function buildPersistableState() {
     const screenshotsToSave = state.screenshots.map(s => {
         // Save localized images (without Image objects, just src/name)
         const localizedImages = {};
@@ -1510,7 +1760,7 @@ function saveState() {
             name: s.name,
             deviceType: s.deviceType,
             localizedImages: localizedImages,
-            background: s.background,
+            background: window.BackupState ? BackupState.serializeBackground(s.background) : s.background,
             screenshot: s.screenshot,
             text: s.text,
             elements: (s.elements || []).map(el => ({
@@ -1532,8 +1782,29 @@ function saveState() {
         customHeight: state.customHeight,
         currentLanguage: state.currentLanguage,
         projectLanguages: state.projectLanguages,
-        defaults: state.defaults
+        defaults: Object.assign({}, state.defaults, {
+            background: window.BackupState ? BackupState.serializeBackground(state.defaults.background) : state.defaults.background
+        }),
+        panoramicBackground: window.BackupState
+            ? BackupState.serializePanoramic(state.panoramicBackground)
+            : { enabled: false, src: '', overlap: 0, scale: 100, offsetY: 0 }
     };
+
+    return stateToSave;
+}
+
+// Save state to IndexedDB for current project. Always serializes the in-memory
+// state (after flushing slider values) so Export Project Backup cannot lag the canvas.
+function saveState() {
+    flushControlsIntoState();
+    const stateToSave = buildPersistableState();
+
+    if (window.AppscreenLive) {
+        try { AppscreenLive.onSaved(stateToSave); } catch (err) { console.error('Live sync error:', err); }
+        if (AppscreenLive.shouldSkipPersist(stateToSave)) return Promise.resolve(stateToSave);
+    }
+
+    if (!persistEnabled) return Promise.resolve(stateToSave);
 
     // Update screenshot count in project metadata
     const project = projects.find(p => p.id === currentProjectId);
@@ -1542,13 +1813,23 @@ function saveState() {
         saveProjectsMeta();
     }
 
-    try {
-        const transaction = db.transaction([PROJECTS_STORE], 'readwrite');
-        const store = transaction.objectStore(PROJECTS_STORE);
-        store.put(stateToSave);
-    } catch (e) {
-        console.error('Error saving state:', e);
-    }
+    if (!db) return Promise.resolve(stateToSave);
+
+    return new Promise((resolve) => {
+        try {
+            const transaction = db.transaction([PROJECTS_STORE], 'readwrite');
+            const store = transaction.objectStore(PROJECTS_STORE);
+            const request = store.put(stateToSave);
+            request.onsuccess = () => resolve(stateToSave);
+            request.onerror = () => {
+                console.error('Error saving state:', request.error);
+                resolve(stateToSave);
+            };
+        } catch (e) {
+            console.error('Error saving state:', e);
+            resolve(stateToSave);
+        }
+    });
 }
 
 // Migrate 3D positions from old formula to new formula
@@ -1663,7 +1944,7 @@ function loadState() {
                                     name: s.name || 'Blank Screen',
                                     deviceType: s.deviceType,
                                     localizedImages: {},
-                                    background: s.background || JSON.parse(JSON.stringify(migratedBackground)),
+                                    background: attachBackgroundImage(s.background || JSON.parse(JSON.stringify(migratedBackground))),
                                     screenshot: screenshotSettings,
                                     text: s.text || JSON.parse(JSON.stringify(migratedText)),
                                     elements: reconstructElementImages(s.elements),
@@ -1682,7 +1963,10 @@ function loadState() {
                                     const langData = s.localizedImages[lang];
                                     if (langData?.src) {
                                         const langImg = new Image();
-                                        langImg.onload = () => {
+                                        let langSettled = false;
+                                        const finishLang = () => {
+                                            if (langSettled) return;
+                                            langSettled = true;
                                             localizedImages[lang] = {
                                                 image: langImg,
                                                 src: langData.src,
@@ -1702,7 +1986,7 @@ function loadState() {
                                                     name: s.name,
                                                     deviceType: s.deviceType,
                                                     localizedImages: localizedImages,
-                                                    background: s.background || JSON.parse(JSON.stringify(migratedBackground)),
+                                                    background: attachBackgroundImage(s.background || JSON.parse(JSON.stringify(migratedBackground))),
                                                     screenshot: screenshotSettings,
                                                     text: s.text || JSON.parse(JSON.stringify(migratedText)),
                                                     elements: reconstructElementImages(s.elements),
@@ -1713,6 +1997,8 @@ function loadState() {
                                                 checkAllLoaded();
                                             }
                                         };
+                                        langImg.onload = finishLang;
+                                        langImg.onerror = finishLang;
                                         langImg.src = langData.src;
                                     } else {
                                         langLoadedCount++;
@@ -1747,7 +2033,7 @@ function loadState() {
                                         name: s.name,
                                         deviceType: s.deviceType,
                                         localizedImages: localizedImages,
-                                        background: s.background || JSON.parse(JSON.stringify(migratedBackground)),
+                                        background: attachBackgroundImage(s.background || JSON.parse(JSON.stringify(migratedBackground))),
                                         screenshot: screenshotSettings,
                                         text: s.text || JSON.parse(JSON.stringify(migratedText)),
                                         elements: reconstructElementImages(s.elements),
@@ -1789,12 +2075,14 @@ function loadState() {
                     // Load global language settings
                     state.currentLanguage = parsed.currentLanguage || 'en';
                     state.projectLanguages = parsed.projectLanguages || ['en'];
+                    state.panoramicBackground = attachPanoramicImage(parsed.panoramicBackground);
 
                     // Load defaults (new format) or use migrated settings
                     if (parsed.defaults) {
                         state.defaults = parsed.defaults;
                         // Ensure elements array exists (may be missing from older saves)
                         if (!state.defaults.elements) state.defaults.elements = [];
+                        attachBackgroundImage(state.defaults.background);
                     } else {
                         state.defaults.background = migratedBackground;
                         state.defaults.screenshot = migratedScreenshot;
@@ -1861,8 +2149,12 @@ function resetStateToDefaults() {
             },
             solid: '#1a1a2e',
             image: null,
+            imageSrc: '',
             imageFit: 'cover',
             imageBlur: 0,
+            imageOffsetX: 0,
+            imageOffsetY: 0,
+            imageScale: 100,
             overlayColor: '#000000',
             overlayOpacity: 0,
             noise: false,
@@ -1916,6 +2208,10 @@ function resetStateToDefaults() {
             position: 'top',
             offsetY: 12,
             lineHeight: 110,
+            textGap: 10,
+            textGapUnit: 'px',
+            headlineLetterSpacing: 0,
+            subheadlineLetterSpacing: 0,
             subheadlineEnabled: false,
             subheadlines: { en: '' },
             subheadlineLanguages: ['en'],
@@ -1929,6 +2225,14 @@ function resetStateToDefaults() {
             subheadlineColor: '#ffffff',
             subheadlineOpacity: 70
         }
+    };
+    state.panoramicBackground = {
+        enabled: false,
+        src: '',
+        image: null,
+        overlap: 0,
+        scale: 100,
+        offsetY: 0
     };
 }
 
@@ -2182,6 +2486,46 @@ function syncUIWithState() {
     document.getElementById('bg-overlay-hex').value = bg.overlayColor;
     document.getElementById('bg-overlay-opacity').value = bg.overlayOpacity;
     document.getElementById('bg-overlay-opacity-value').textContent = formatValue(bg.overlayOpacity) + '%';
+    setSliderValue('bg-image-offset-x', bg.imageOffsetX || 0);
+    const bgOffsetX = document.getElementById('bg-image-offset-x-value');
+    if (bgOffsetX) bgOffsetX.textContent = formatValue(bg.imageOffsetX || 0) + '%';
+    setSliderValue('bg-image-offset-y', bg.imageOffsetY || 0);
+    const bgOffsetY = document.getElementById('bg-image-offset-y-value');
+    if (bgOffsetY) bgOffsetY.textContent = formatValue(bg.imageOffsetY || 0) + '%';
+    setSliderValue('bg-image-scale', bg.imageScale == null ? 100 : bg.imageScale);
+    const bgScale = document.getElementById('bg-image-scale-value');
+    if (bgScale) bgScale.textContent = formatValue(bg.imageScale == null ? 100 : bg.imageScale) + '%';
+    const bgPreview = document.getElementById('bg-image-preview');
+    if (bgPreview) {
+        const src = bg.imageSrc || (bg.image && bg.image.src) || '';
+        if (src) {
+            bgPreview.src = src;
+            bgPreview.style.display = 'block';
+        } else {
+            bgPreview.style.display = 'none';
+        }
+    }
+    const pano = state.panoramicBackground || {};
+    const panoToggle = document.getElementById('panoramic-toggle');
+    if (panoToggle) panoToggle.classList.toggle('active', !!pano.enabled);
+    setSliderValue('panoramic-overlap', Math.round((pano.overlap || 0) * 100));
+    const panoOverlap = document.getElementById('panoramic-overlap-value');
+    if (panoOverlap) panoOverlap.textContent = formatValue((pano.overlap || 0) * 100) + '%';
+    setSliderValue('panoramic-scale', pano.scale == null ? 100 : pano.scale);
+    const panoScale = document.getElementById('panoramic-scale-value');
+    if (panoScale) panoScale.textContent = formatValue(pano.scale == null ? 100 : pano.scale) + '%';
+    setSliderValue('panoramic-offset-y', pano.offsetY || 0);
+    const panoY = document.getElementById('panoramic-offset-y-value');
+    if (panoY) panoY.textContent = formatValue(pano.offsetY || 0) + '%';
+    const panoPreview = document.getElementById('panoramic-preview');
+    if (panoPreview) {
+        if (pano.src) {
+            panoPreview.src = pano.src;
+            panoPreview.style.display = 'block';
+        } else {
+            panoPreview.style.display = 'none';
+        }
+    }
 
     // Noise
     document.getElementById('noise-toggle').classList.toggle('active', bg.noise);
@@ -2189,15 +2533,15 @@ function syncUIWithState() {
     document.getElementById('noise-intensity-value').textContent = formatValue(bg.noiseIntensity) + '%';
 
     // Screenshot settings
-    document.getElementById('screenshot-scale').value = ss.scale;
+    setSliderValue('screenshot-scale', ss.scale);
     document.getElementById('screenshot-scale-value').textContent = formatValue(ss.scale) + '%';
-    document.getElementById('screenshot-y').value = ss.y;
+    setSliderValue('screenshot-y', ss.y);
     document.getElementById('screenshot-y-value').textContent = formatValue(ss.y) + '%';
-    document.getElementById('screenshot-x').value = ss.x;
+    setSliderValue('screenshot-x', ss.x);
     document.getElementById('screenshot-x-value').textContent = formatValue(ss.x) + '%';
     document.getElementById('corner-radius').value = ss.cornerRadius;
     document.getElementById('corner-radius-value').textContent = formatValue(ss.cornerRadius) + 'px';
-    document.getElementById('screenshot-rotation').value = ss.rotation;
+    setSliderValue('screenshot-rotation', ss.rotation);
     document.getElementById('screenshot-rotation-value').textContent = formatValue(ss.rotation) + '°';
 
     // Shadow
@@ -2249,6 +2593,7 @@ function syncUIWithState() {
     document.getElementById('text-offset-y-value').textContent = formatValue(layoutSettings.offsetY) + '%';
     document.getElementById('line-height').value = layoutSettings.lineHeight;
     document.getElementById('line-height-value').textContent = formatValue(layoutSettings.lineHeight) + '%';
+    syncTextSpacingControls(txt);
     const currentSubheadline = txt.subheadlines ? (txt.subheadlines[subheadlineLang] || '') : (txt.subheadline || '');
     document.getElementById('subheadline-text').value = currentSubheadline;
     document.getElementById('subheadline-font').value = txt.subheadlineFont || txt.headlineFont;
@@ -2289,11 +2634,11 @@ function syncUIWithState() {
     });
     updateFrameColorSwatches(device3D, ss.frameColor);
     document.getElementById('rotation-3d-options').style.display = use3D ? 'block' : 'none';
-    document.getElementById('rotation-3d-x').value = rotation3D.x;
+    setSliderValue('rotation-3d-x', rotation3D.x);
     document.getElementById('rotation-3d-x-value').textContent = formatValue(rotation3D.x) + '°';
-    document.getElementById('rotation-3d-y').value = rotation3D.y;
+    setSliderValue('rotation-3d-y', rotation3D.y);
     document.getElementById('rotation-3d-y-value').textContent = formatValue(rotation3D.y) + '°';
-    document.getElementById('rotation-3d-z').value = rotation3D.z;
+    setSliderValue('rotation-3d-z', rotation3D.z);
     document.getElementById('rotation-3d-z-value').textContent = formatValue(rotation3D.z) + '°';
 
     // Hide 2D-only settings in 3D mode, show 3D tip
@@ -3787,6 +4132,7 @@ function setupEventListeners() {
     document.getElementById('export-project-btn').addEventListener('click', async () => {
         if (!db) return;
         try {
+            const snapshot = await saveState();
             const dump = {};
             for (const name of db.objectStoreNames) {
                 const tx = db.transaction(name, 'readonly');
@@ -3796,6 +4142,12 @@ function setupEventListeners() {
                     req.onsuccess = () => resolve(req.result);
                     req.onerror = () => resolve([]);
                 });
+            }
+            if (snapshot) {
+                dump.projects = Array.isArray(dump.projects) ? dump.projects : [];
+                const existing = dump.projects.findIndex(p => p.id === snapshot.id);
+                if (existing >= 0) dump.projects[existing] = snapshot;
+                else dump.projects.push(snapshot);
             }
             const json = JSON.stringify(dump, null, 2);
             const blob = new Blob([json], { type: 'application/json' });
@@ -4268,7 +4620,9 @@ function setupEventListeners() {
             reader.onload = (event) => {
                 const img = new Image();
                 img.onload = () => {
+                    setBackground('type', 'image');
                     setBackground('image', img);
+                    setBackground('imageSrc', event.target.result);
                     document.getElementById('bg-image-preview').src = event.target.result;
                     document.getElementById('bg-image-preview').style.display = 'block';
                     updateCanvas();
@@ -4299,6 +4653,75 @@ function setupEventListeners() {
     document.getElementById('bg-overlay-opacity').addEventListener('input', (e) => {
         setBackground('overlayOpacity', parseInt(e.target.value));
         document.getElementById('bg-overlay-opacity-value').textContent = formatValue(e.target.value) + '%';
+        updateCanvas();
+    });
+
+    document.getElementById('bg-image-offset-x').addEventListener('input', (e) => {
+        setBackground('imageOffsetX', parseInt(e.target.value));
+        document.getElementById('bg-image-offset-x-value').textContent = formatValue(e.target.value) + '%';
+        updateCanvas();
+    });
+    document.getElementById('bg-image-offset-y').addEventListener('input', (e) => {
+        setBackground('imageOffsetY', parseInt(e.target.value));
+        document.getElementById('bg-image-offset-y-value').textContent = formatValue(e.target.value) + '%';
+        updateCanvas();
+    });
+    document.getElementById('bg-image-scale').addEventListener('input', (e) => {
+        setBackground('imageScale', parseInt(e.target.value));
+        document.getElementById('bg-image-scale-value').textContent = formatValue(e.target.value) + '%';
+        updateCanvas();
+    });
+
+    document.getElementById('panoramic-toggle').addEventListener('click', function () {
+        this.classList.toggle('active');
+        state.panoramicBackground = state.panoramicBackground || attachPanoramicImage(null);
+        state.panoramicBackground.enabled = this.classList.contains('active');
+        updateCanvas();
+    });
+    document.getElementById('panoramic-upload').addEventListener('click', () => {
+        document.getElementById('panoramic-input').click();
+    });
+    document.getElementById('panoramic-input').addEventListener('change', (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            const img = new Image();
+            img.onload = () => {
+                state.panoramicBackground = {
+                    enabled: true,
+                    src: event.target.result,
+                    image: img,
+                    overlap: state.panoramicBackground?.overlap || 0,
+                    scale: state.panoramicBackground?.scale || 100,
+                    offsetY: state.panoramicBackground?.offsetY || 0
+                };
+                const toggle = document.getElementById('panoramic-toggle');
+                if (toggle) toggle.classList.add('active');
+                const preview = document.getElementById('panoramic-preview');
+                if (preview) {
+                    preview.src = event.target.result;
+                    preview.style.display = 'block';
+                }
+                updateCanvas();
+            };
+            img.src = event.target.result;
+        };
+        reader.readAsDataURL(file);
+    });
+    document.getElementById('panoramic-overlap').addEventListener('input', (e) => {
+        state.panoramicBackground.overlap = parseInt(e.target.value, 10) / 100;
+        document.getElementById('panoramic-overlap-value').textContent = formatValue(e.target.value) + '%';
+        updateCanvas();
+    });
+    document.getElementById('panoramic-scale').addEventListener('input', (e) => {
+        state.panoramicBackground.scale = parseInt(e.target.value, 10);
+        document.getElementById('panoramic-scale-value').textContent = formatValue(e.target.value) + '%';
+        updateCanvas();
+    });
+    document.getElementById('panoramic-offset-y').addEventListener('input', (e) => {
+        state.panoramicBackground.offsetY = parseInt(e.target.value, 10);
+        document.getElementById('panoramic-offset-y-value').textContent = formatValue(e.target.value) + '%';
         updateCanvas();
     });
 
@@ -4556,6 +4979,29 @@ function setupEventListeners() {
     document.getElementById('line-height').addEventListener('input', (e) => {
         setTextLanguageValue('lineHeight', parseInt(e.target.value));
         document.getElementById('line-height-value').textContent = formatValue(e.target.value) + '%';
+        updateCanvas();
+    });
+
+    document.getElementById('text-gap').addEventListener('input', (e) => {
+        setTextSetting('textGap', parseInt(e.target.value, 10));
+        const unit = document.getElementById('text-gap-unit').value === 'percent' ? '%' : 'px';
+        document.getElementById('text-gap-value').textContent = formatValue(e.target.value) + unit;
+        updateCanvas();
+    });
+    document.getElementById('text-gap-unit').addEventListener('change', (e) => {
+        setTextSetting('textGapUnit', e.target.value);
+        const gap = document.getElementById('text-gap').value;
+        document.getElementById('text-gap-value').textContent = formatValue(gap) + (e.target.value === 'percent' ? '%' : 'px');
+        updateCanvas();
+    });
+    document.getElementById('headline-letter-spacing').addEventListener('input', (e) => {
+        setTextSetting('headlineLetterSpacing', parseInt(e.target.value, 10));
+        document.getElementById('headline-letter-spacing-value').textContent = formatValue(e.target.value) + 'px';
+        updateCanvas();
+    });
+    document.getElementById('subheadline-letter-spacing').addEventListener('input', (e) => {
+        setTextSetting('subheadlineLetterSpacing', parseInt(e.target.value, 10));
+        document.getElementById('subheadline-letter-spacing-value').textContent = formatValue(e.target.value) + 'px';
         updateCanvas();
     });
 
@@ -5956,6 +6402,7 @@ function updateTextUI(text) {
     document.getElementById('text-offset-y-value').textContent = formatValue(layoutSettings.offsetY) + '%';
     document.getElementById('line-height').value = layoutSettings.lineHeight;
     document.getElementById('line-height-value').textContent = formatValue(layoutSettings.lineHeight) + '%';
+    syncTextSpacingControls(text);
     document.getElementById('subheadline-text').value = subheadlineText;
     document.getElementById('subheadline-font').value = text.subheadlineFont || text.headlineFont;
     document.getElementById('subheadline-size').value = subheadlineLayout.subheadlineSize;
@@ -6197,7 +6644,7 @@ function createNewScreenshot(img, src, name, lang, deviceType) {
         name: name || 'Blank Screen',
         deviceType: deviceType,
         localizedImages: localizedImages,
-        background: JSON.parse(JSON.stringify(state.defaults.background)),
+        background: copyBackgroundSettings(state.defaults.background),
         screenshot: JSON.parse(JSON.stringify(state.defaults.screenshot)),
         text: JSON.parse(JSON.stringify(textDefaults)),
         elements: JSON.parse(JSON.stringify(state.defaults.elements || [])),
@@ -6580,12 +7027,7 @@ function transferStyle(sourceIndex, targetIndex) {
         return;
     }
 
-    // Deep copy background settings
-    target.background = JSON.parse(JSON.stringify(source.background));
-    // Handle background image separately (not JSON serializable)
-    if (source.background.image) {
-        target.background.image = source.background.image;
-    }
+    target.background = copyBackgroundSettings(source.background);
 
     // Deep copy screenshot settings
     target.screenshot = JSON.parse(JSON.stringify(source.screenshot));
@@ -6643,12 +7085,7 @@ function applyStyleToAll() {
     state.screenshots.forEach((target, index) => {
         if (index === applyStyleSourceIndex) return; // Skip source
 
-        // Deep copy background settings
-        target.background = JSON.parse(JSON.stringify(source.background));
-        // Handle background image separately (not JSON serializable)
-        if (source.background.image) {
-            target.background.image = source.background.image;
-        }
+        target.background = copyBackgroundSettings(source.background);
 
         // Deep copy screenshot settings
         target.screenshot = JSON.parse(JSON.stringify(source.screenshot));
@@ -6803,10 +7240,11 @@ function updateCanvas() {
     canvas.width = dims.width;
     canvas.height = dims.height;
 
-    // Scale for preview
+    // Scale for preview. Render mode keeps the canvas at the export pixel size.
     const maxPreviewWidth = 400;
     const maxPreviewHeight = 700;
-    const scale = Math.min(maxPreviewWidth / dims.width, maxPreviewHeight / dims.height);
+    const renderMode = document.documentElement.classList.contains('render-mode');
+    const scale = renderMode ? 1 : Math.min(maxPreviewWidth / dims.width, maxPreviewHeight / dims.height);
     canvas.style.width = (dims.width * scale) + 'px';
     canvas.style.height = (dims.height * scale) + 'px';
 
@@ -6851,8 +7289,11 @@ function updateCanvas() {
     // Elements above text
     drawElements(ctx, dims, 'above-text');
 
-    // Update side previews
-    updateSidePreviews();
+    // Update side previews. Headless render only needs the main canvas.
+    if (!document.documentElement.classList.contains('render-mode')) {
+        updateSidePreviews();
+    }
+    if (window.AppscreenLive) AppscreenLive.afterRender();
 }
 
 function updateSidePreviews() {
@@ -7060,7 +7501,7 @@ function renderScreenshotToCanvas(index, targetCanvas, targetCtx, dims, previewS
 
     // Draw background for this screenshot
     const bg = screenshot.background;
-    drawBackgroundToContext(targetCtx, dims, bg);
+    drawBackgroundToContext(targetCtx, dims, bg, index);
 
     // Draw noise if enabled
     if (bg.noise) {
@@ -7101,7 +7542,11 @@ function renderScreenshotToCanvas(index, targetCanvas, targetCtx, dims, previewS
     drawElementsToContext(targetCtx, dims, elements, 'above-text');
 }
 
-function drawBackgroundToContext(context, dims, bg) {
+function drawBackgroundToContext(context, dims, bg, index) {
+    if (drawPanoramicSlice(context, dims, index)) {
+        paintOverlay(context, dims, bg);
+        return;
+    }
     if (bg.type === 'gradient') {
         const angle = bg.gradient.angle * Math.PI / 180;
         const x1 = dims.width / 2 - Math.cos(angle) * dims.width;
@@ -7120,50 +7565,7 @@ function drawBackgroundToContext(context, dims, bg) {
         context.fillStyle = bg.solid;
         context.fillRect(0, 0, dims.width, dims.height);
     } else if (bg.type === 'image' && bg.image) {
-        const img = bg.image;
-        let sx = 0, sy = 0, sw = img.width, sh = img.height;
-        let dx = 0, dy = 0, dw = dims.width, dh = dims.height;
-
-        if (bg.imageFit === 'cover') {
-            const imgRatio = img.width / img.height;
-            const canvasRatio = dims.width / dims.height;
-
-            if (imgRatio > canvasRatio) {
-                sw = img.height * canvasRatio;
-                sx = (img.width - sw) / 2;
-            } else {
-                sh = img.width / canvasRatio;
-                sy = (img.height - sh) / 2;
-            }
-        } else if (bg.imageFit === 'contain') {
-            const imgRatio = img.width / img.height;
-            const canvasRatio = dims.width / dims.height;
-
-            if (imgRatio > canvasRatio) {
-                dh = dims.width / imgRatio;
-                dy = (dims.height - dh) / 2;
-            } else {
-                dw = dims.height * imgRatio;
-                dx = (dims.width - dw) / 2;
-            }
-
-            context.fillStyle = '#000';
-            context.fillRect(0, 0, dims.width, dims.height);
-        }
-
-        if (bg.imageBlur > 0) {
-            context.filter = `blur(${bg.imageBlur}px)`;
-        }
-
-        context.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
-        context.filter = 'none';
-
-        if (bg.overlayOpacity > 0) {
-            context.fillStyle = bg.overlayColor;
-            context.globalAlpha = bg.overlayOpacity / 100;
-            context.fillRect(0, 0, dims.width, dims.height);
-            context.globalAlpha = 1;
-        }
+        drawBackgroundImage(context, bg, dims);
     }
 }
 
@@ -7315,6 +7717,7 @@ function drawTextToContext(context, dims, txt) {
         const fontStyle = txt.headlineItalic ? 'italic' : 'normal';
         context.font = `${fontStyle} ${txt.headlineWeight} ${headlineLayout.headlineSize}px ${txt.headlineFont}`;
         context.fillStyle = txt.headlineColor;
+        applyLetterSpacing(context, txt.headlineLetterSpacing);
 
         const lines = wrapText(context, headline, dims.width - padding * 2);
         const lineHeight = headlineLayout.headlineSize * (layoutSettings.lineHeight / 100);
@@ -7356,7 +7759,7 @@ function drawTextToContext(context, dims, txt) {
         // Track where subheadline should start (below the bottom edge of headline)
         // The gap between headline and subheadline should be (lineHeight - fontSize)
         // This is the "extra" spacing beyond the text itself
-        const gap = lineHeight - headlineLayout.headlineSize;
+        const gap = textGapPixels(txt, layoutSettings, dims.height);
         if (layoutSettings.position === 'top') {
             // For top: lastLineY is top of last line, add fontSize to get bottom, then add gap
             currentY = lastLineY + headlineLayout.headlineSize + gap;
@@ -7371,6 +7774,7 @@ function drawTextToContext(context, dims, txt) {
         const subFontStyle = txt.subheadlineItalic ? 'italic' : 'normal';
         const subWeight = txt.subheadlineWeight || '400';
         context.font = `${subFontStyle} ${subWeight} ${subheadlineLayout.subheadlineSize}px ${txt.subheadlineFont || txt.headlineFont}`;
+        applyLetterSpacing(context, txt.subheadlineLetterSpacing);
         context.fillStyle = hexToRgba(txt.subheadlineColor, txt.subheadlineOpacity / 100);
 
         const lines = wrapText(context, subheadline, dims.width - padding * 2);
@@ -7411,6 +7815,7 @@ function drawTextToContext(context, dims, txt) {
             context.textBaseline = 'bottom';
         }
     }
+    applyLetterSpacing(context, 0);
 }
 
 // Draw elements for the current screenshot at a specific layer
@@ -7690,9 +8095,123 @@ function drawStar(context, cx, cy, size, color) {
     context.restore();
 }
 
+function textGapPixels(text, layout, canvasHeight) {
+    if (text && typeof text.textGap === 'number') {
+        if (text.textGapUnit === 'percent') return canvasHeight * (text.textGap / 100);
+        return text.textGap;
+    }
+    const lineHeight = layout.headlineSize * ((layout.lineHeight || 110) / 100);
+    return lineHeight - layout.headlineSize;
+}
+
+function applyLetterSpacing(context, px) {
+    if (!context || !('letterSpacing' in context)) return;
+    context.letterSpacing = `${Number(px) || 0}px`;
+}
+
+function paintOverlay(context, dims, bg) {
+    if (!bg || !(bg.overlayOpacity > 0)) return;
+    context.fillStyle = bg.overlayColor || '#000000';
+    context.globalAlpha = bg.overlayOpacity / 100;
+    context.fillRect(0, 0, dims.width, dims.height);
+    context.globalAlpha = 1;
+}
+
+function drawPanoramicSlice(context, dims, index) {
+    const pano = state.panoramicBackground;
+    if (!pano || !pano.enabled || !pano.image || !pano.image.width) return false;
+    const img = pano.image;
+    const count = Math.max(1, state.screenshots.length);
+    const win = window.BackupState
+        ? BackupState.panoramicWindow(img.width, count, index || 0, pano.overlap || 0)
+        : { sx: 0, sw: img.width };
+    const zoom = (pano.scale || 100) / 100 || 1;
+    let sw = win.sw / zoom;
+    let sh = img.height / zoom;
+    let sx = win.sx + (win.sw - sw) / 2;
+    let sy = (img.height - sh) / 2 + ((pano.offsetY || 0) / 100) * img.height;
+    sx = Math.max(0, Math.min(img.width - 1, sx));
+    sy = Math.max(0, Math.min(img.height - 1, sy));
+    sw = Math.max(1, Math.min(img.width - sx, sw));
+    sh = Math.max(1, Math.min(img.height - sy, sh));
+    context.drawImage(img, sx, sy, sw, sh, 0, 0, dims.width, dims.height);
+    return true;
+}
+
+function drawBackgroundImage(context, bg, dims) {
+    const img = bg.image;
+    if (!img || !img.width) return;
+    let sx = 0, sy = 0, sw = img.width, sh = img.height;
+    let dx = 0, dy = 0, dw = dims.width, dh = dims.height;
+    const fit = bg.imageFit || 'cover';
+
+    if (fit === 'cover') {
+        const imgRatio = img.width / img.height;
+        const canvasRatio = dims.width / dims.height;
+        if (imgRatio > canvasRatio) {
+            sw = img.height * canvasRatio;
+            sx = (img.width - sw) / 2;
+        } else {
+            sh = img.width / canvasRatio;
+            sy = (img.height - sh) / 2;
+        }
+    } else if (fit === 'contain') {
+        const imgRatio = img.width / img.height;
+        const canvasRatio = dims.width / dims.height;
+        if (imgRatio > canvasRatio) {
+            dh = dims.width / imgRatio;
+            dy = (dims.height - dh) / 2;
+        } else {
+            dw = dims.height * imgRatio;
+            dx = (dims.width - dw) / 2;
+        }
+        context.fillStyle = '#000';
+        context.fillRect(0, 0, dims.width, dims.height);
+    }
+
+    const zoom = (bg.imageScale == null ? 100 : bg.imageScale) / 100 || 1;
+    if (zoom !== 1) {
+        if (fit === 'cover') {
+            const nsw = sw / zoom;
+            const nsh = sh / zoom;
+            sx += (sw - nsw) / 2;
+            sy += (sh - nsh) / 2;
+            sw = nsw;
+            sh = nsh;
+        } else {
+            const cx = dx + dw / 2;
+            const cy = dy + dh / 2;
+            dw *= zoom;
+            dh *= zoom;
+            dx = cx - dw / 2;
+            dy = cy - dh / 2;
+        }
+    }
+
+    const ox = ((bg.imageOffsetX || 0) / 100) * dims.width;
+    const oy = ((bg.imageOffsetY || 0) / 100) * dims.height;
+    if (fit === 'cover') {
+        sx -= (ox / dims.width) * sw;
+        sy -= (oy / dims.height) * sh;
+    } else {
+        dx += ox;
+        dy += oy;
+    }
+
+    if (bg.imageBlur > 0) context.filter = `blur(${bg.imageBlur}px)`;
+    context.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+    context.filter = 'none';
+    paintOverlay(context, dims, bg);
+}
+
 function drawBackground() {
     const dims = getCanvasDimensions();
     const bg = getBackground();
+
+    if (drawPanoramicSlice(ctx, dims, state.selectedIndex)) {
+        paintOverlay(ctx, dims, bg);
+        return;
+    }
 
     if (bg.type === 'gradient') {
         const angle = bg.gradient.angle * Math.PI / 180;
@@ -7712,51 +8231,7 @@ function drawBackground() {
         ctx.fillStyle = bg.solid;
         ctx.fillRect(0, 0, dims.width, dims.height);
     } else if (bg.type === 'image' && bg.image) {
-        const img = bg.image;
-        let sx = 0, sy = 0, sw = img.width, sh = img.height;
-        let dx = 0, dy = 0, dw = dims.width, dh = dims.height;
-
-        if (bg.imageFit === 'cover') {
-            const imgRatio = img.width / img.height;
-            const canvasRatio = dims.width / dims.height;
-
-            if (imgRatio > canvasRatio) {
-                sw = img.height * canvasRatio;
-                sx = (img.width - sw) / 2;
-            } else {
-                sh = img.width / canvasRatio;
-                sy = (img.height - sh) / 2;
-            }
-        } else if (bg.imageFit === 'contain') {
-            const imgRatio = img.width / img.height;
-            const canvasRatio = dims.width / dims.height;
-
-            if (imgRatio > canvasRatio) {
-                dh = dims.width / imgRatio;
-                dy = (dims.height - dh) / 2;
-            } else {
-                dw = dims.height * imgRatio;
-                dx = (dims.width - dw) / 2;
-            }
-
-            ctx.fillStyle = '#000';
-            ctx.fillRect(0, 0, dims.width, dims.height);
-        }
-
-        if (bg.imageBlur > 0) {
-            ctx.filter = `blur(${bg.imageBlur}px)`;
-        }
-
-        ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
-        ctx.filter = 'none';
-
-        // Overlay
-        if (bg.overlayOpacity > 0) {
-            ctx.fillStyle = bg.overlayColor;
-            ctx.globalAlpha = bg.overlayOpacity / 100;
-            ctx.fillRect(0, 0, dims.width, dims.height);
-            ctx.globalAlpha = 1;
-        }
+        drawBackgroundImage(ctx, bg, dims);
     }
 }
 
@@ -7910,6 +8385,7 @@ function drawText() {
         const fontStyle = text.headlineItalic ? 'italic' : 'normal';
         ctx.font = `${fontStyle} ${text.headlineWeight} ${headlineLayout.headlineSize}px ${text.headlineFont}`;
         ctx.fillStyle = text.headlineColor;
+        applyLetterSpacing(ctx, text.headlineLetterSpacing);
 
         const lines = wrapText(ctx, headline, dims.width - padding * 2);
         const lineHeight = headlineLayout.headlineSize * (layoutSettings.lineHeight / 100);
@@ -7951,7 +8427,7 @@ function drawText() {
         // Track where subheadline should start (below the bottom edge of headline)
         // The gap between headline and subheadline should be (lineHeight - fontSize)
         // This is the "extra" spacing beyond the text itself
-        const gap = lineHeight - headlineLayout.headlineSize;
+        const gap = textGapPixels(text, layoutSettings, dims.height);
         if (layoutSettings.position === 'top') {
             // For top: lastLineY is top of last line, add fontSize to get bottom, then add gap
             currentY = lastLineY + headlineLayout.headlineSize + gap;
@@ -7966,6 +8442,7 @@ function drawText() {
         const subFontStyle = text.subheadlineItalic ? 'italic' : 'normal';
         const subWeight = text.subheadlineWeight || '400';
         ctx.font = `${subFontStyle} ${subWeight} ${subheadlineLayout.subheadlineSize}px ${text.subheadlineFont || text.headlineFont}`;
+        applyLetterSpacing(ctx, text.subheadlineLetterSpacing);
         ctx.fillStyle = hexToRgba(text.subheadlineColor, text.subheadlineOpacity / 100);
 
         const lines = wrapText(ctx, subheadline, dims.width - padding * 2);
@@ -8006,6 +8483,7 @@ function drawText() {
             ctx.textBaseline = 'bottom';
         }
     }
+    applyLetterSpacing(ctx, 0);
 }
 
 function drawNoise() {
@@ -8084,7 +8562,8 @@ async function exportCurrent() {
         return;
     }
 
-    // Ensure canvas is up-to-date (especially important for 3D mode)
+    await ensureProjectFonts();
+    flushControlsIntoState();
     updateCanvas();
 
     const link = document.createElement('a');
