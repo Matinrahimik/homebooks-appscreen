@@ -1,10 +1,12 @@
 import { canWriteProject, editKeyFromRequest, requireMcpToken } from "./auth.ts";
 import { foldAssetUrls, presentAssetRefs, replaceDataUrls } from "./assets.ts";
-import { getBytes, KvLimitError, MAX_OBJECT_BYTES } from "./kvblob.ts";
+import { KV_VALUE_LIMIT, KvLimitError, MAX_OBJECT_BYTES, openByteStream, putStreamedBytes, readBlobMeta } from "./kvblob.ts";
+import { logStage } from "./log.ts";
 import { handleMcpRpc, mcpHttpBody } from "./mcp.ts";
 import { assertBackup, ProjectError, setProjectName } from "./project.ts";
-import { getEnvelope, getPublicFile, readProjectDoc, replaceProjectDoc } from "./store.ts";
+import { getEnvelope, publicFileKey, readProjectDoc, readRenderToken, replaceProjectDoc, writeRenderToken } from "./store.ts";
 import type { Env, Services } from "./types.ts";
+import { storeZipStream } from "./zip.ts";
 
 const PAGES_ORIGIN = "https://matinrahimik.github.io";
 
@@ -20,7 +22,10 @@ export function corsHeaders(request: Request, env: Env): Headers {
   headers.set("Access-Control-Allow-Origin", origin);
   headers.set("Vary", "Origin");
   headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Edit-Key, Accept");
+  headers.set(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, X-Edit-Key, Accept, X-Appscreen-Crc, X-Appscreen-Width, X-Appscreen-Height, X-Appscreen-Sha256, X-Appscreen-Index",
+  );
   headers.set("Access-Control-Max-Age", "86400");
   return headers;
 }
@@ -105,30 +110,18 @@ async function routeInner(
 
   const assetMatch = url.pathname.match(/^\/assets\/([a-f0-9]{64})$/i);
   if (assetMatch && request.method === "GET") {
-    const file = await getBytes(env.APPSCREEN_KV, `asset:${assetMatch[1].toLowerCase()}`);
-    if (!file) return json({ error: "not_found" }, 404);
-    return new Response(file.bytes, {
-      status: 200,
-      headers: {
-        "content-type": file.contentType,
-        "content-length": String(file.bytes.byteLength),
-        "cache-control": "public, max-age=31536000, immutable",
-      },
-    });
+    return streamAsset(env, assetMatch[1].toLowerCase());
+  }
+
+  const renderMatch = url.pathname.match(/^\/renders\/([a-f0-9]{64})$/i);
+  if (renderMatch && request.method === "PUT") {
+    return putRender(request, env, renderMatch[1].toLowerCase());
   }
 
   const fileMatch = url.pathname.match(/^\/f\/([a-f0-9]{32,128})(?:\/([^/]+))?$/i);
   if (fileMatch && request.method === "GET") {
-    const file = await getPublicFile(env.APPSCREEN_KV, fileMatch[1]);
-    if (!file) return json({ error: "not_found" }, 404);
     const filename = fileMatch[2] ? decodeURIComponent(fileMatch[2]) : "download";
-    const headers = new Headers({
-      "content-type": file.contentType,
-      "content-length": String(file.bytes.byteLength),
-      "cache-control": "public, max-age=31536000, immutable",
-      "content-disposition": `${file.contentType === "application/zip" ? "attachment" : "inline"}; filename="${filename.replace(/"/g, "")}"`,
-    });
-    return new Response(file.bytes, { status: 200, headers });
+    return streamPublicFile(env, fileMatch[1], filename);
   }
 
   const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
@@ -140,6 +133,124 @@ async function routeInner(
   }
 
   return json({ error: "not_found" }, 404);
+}
+
+const IMMUTABLE = "public, max-age=31536000, immutable";
+
+function contentLength(request: Request): number | null {
+  const raw = request.headers.get("content-length");
+  if (raw == null || !/^\d+$/.test(raw)) return null;
+  const size = Number(raw);
+  return Number.isSafeInteger(size) ? size : null;
+}
+
+function integerHeader(request: Request, name: string): number | null {
+  const raw = request.headers.get(name);
+  if (raw == null || !/^\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+async function streamAsset(env: Env, hash: string): Promise<Response> {
+  const key = `asset:${hash}`;
+  const meta = await readBlobMeta(env.APPSCREEN_KV, key);
+  if (!meta || meta.encoding !== "bytes") return json({ error: "not_found" }, 404);
+  const opened = await openByteStream(env.APPSCREEN_KV, key);
+  if (!opened) return json({ error: "not_found" }, 404);
+  logStage("asset_stream", { hash, bytes: opened.size, chunks: meta.chunks });
+  return new Response(opened.stream, {
+    status: 200,
+    headers: {
+      "content-type": opened.contentType,
+      "content-length": String(opened.size),
+      "cache-control": IMMUTABLE,
+    },
+  });
+}
+
+async function streamPublicFile(env: Env, token: string, filename: string): Promise<Response> {
+  const key = publicFileKey(token);
+  const meta = await readBlobMeta(env.APPSCREEN_KV, key);
+  if (!meta) return json({ error: "not_found" }, 404);
+  const safeName = filename.replace(/"/g, "");
+  const disposition = `${meta.contentType === "application/zip" ? "attachment" : "inline"}; filename="${safeName}"`;
+  if (meta.encoding === "store-zip") {
+    const files = meta.files || [];
+    const stream = storeZipStream(
+      files.map((file) => ({ name: file.name, crc: file.crc, size: file.size })),
+      async (index) => {
+        const opened = await openByteStream(env.APPSCREEN_KV, files[index].key);
+        return opened ? opened.stream : null;
+      },
+      new Date(meta.when || "2020-01-01T00:00:00.000Z"),
+    );
+    logStage("zip_stream", { files: files.length, bytes: meta.size });
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "content-type": "application/zip",
+        "content-length": String(meta.size),
+        "cache-control": IMMUTABLE,
+        "content-disposition": disposition,
+      },
+    });
+  }
+  if (meta.encoding !== "bytes") return json({ error: "not_found" }, 404);
+  const opened = await openByteStream(env.APPSCREEN_KV, key);
+  if (!opened) return json({ error: "not_found" }, 404);
+  return new Response(opened.stream, {
+    status: 200,
+    headers: {
+      "content-type": opened.contentType,
+      "content-length": String(opened.size),
+      "cache-control": IMMUTABLE,
+      "content-disposition": disposition,
+    },
+  });
+}
+
+async function putRender(request: Request, env: Env, token: string): Promise<Response> {
+  const record = await readRenderToken(env.APPSCREEN_KV, token);
+  if (!record) return json({ error: "not_found", message: "Upload token is unknown." }, 404);
+  const index = integerHeader(request, "x-appscreen-index");
+  const width = integerHeader(request, "x-appscreen-width");
+  const height = integerHeader(request, "x-appscreen-height");
+  const crc = integerHeader(request, "x-appscreen-crc");
+  const sha = (request.headers.get("x-appscreen-sha256") || "").toLowerCase();
+  if (index !== record.index || width == null || width <= 0 || height == null || height <= 0) {
+    return json({ error: "invalid_upload", message: "Screenshot index and pixel size are required." }, 400);
+  }
+  if (crc == null || crc > 0xffffffff || !/^[a-f0-9]{64}$/.test(sha)) {
+    return json({ error: "invalid_upload", message: "Screenshot crc32 and sha256 are required." }, 400);
+  }
+  const size = contentLength(request);
+  if (size == null) {
+    return json({ error: "length_required", message: "Content-Length is required. The body is stored as a stream." }, 411);
+  }
+  if (size <= 0) return json({ error: "invalid_upload", message: "Rendered PNG is empty." }, 400);
+  if (size > KV_VALUE_LIMIT) {
+    return json(
+      {
+        error: "kv_limit",
+        message: `Rendered PNG is ${size} bytes, above the ${KV_VALUE_LIMIT} byte KV value limit. The upload was not read.`,
+      },
+      413,
+    );
+  }
+  if (!request.body) return json({ error: "invalid_upload", message: "Rendered PNG body is missing." }, 400);
+  await putStreamedBytes(env.APPSCREEN_KV, publicFileKey(token), request.body, size, "image/png");
+  await writeRenderToken(env.APPSCREEN_KV, token, {
+    ...record,
+    uploaded: true,
+    bytes: size,
+    width,
+    height,
+    sha256: sha,
+    crc,
+  });
+  logStage("render_upload", { index, bytes: size, sha256: sha });
+  const url = new URL(`/f/${token}/${record.filename}`, publicOrigin(request, env));
+  return json({ ok: true, bytes: size, url: url.toString() });
 }
 
 async function getProject(request: Request, env: Env, id: string): Promise<Response> {

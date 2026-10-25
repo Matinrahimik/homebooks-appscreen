@@ -52,11 +52,13 @@ export function chunkString(value: string, maxChars = CHUNK_CHARS): string[] {
   return out;
 }
 
-interface BlobMeta {
+export interface BlobMeta {
   chunks: number;
   size: number;
-  encoding: "bytes" | "text";
+  encoding: "bytes" | "text" | "store-zip";
   contentType?: string;
+  files?: { name: string; key: string; crc: number; size: number }[];
+  when?: string;
 }
 
 function metaKey(key: string): string {
@@ -141,6 +143,96 @@ export async function putBytes(
   };
   await kv.put(metaKey(key), JSON.stringify(meta));
   for (let i = parts.length; i < previous; i++) await kv.delete(chunkKey(key, i));
+}
+
+export async function readBlobMeta(kv: KvLike, key: string): Promise<BlobMeta | null> {
+  const raw = await kv.get(metaKey(key), { type: "text" });
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    return JSON.parse(raw) as BlobMeta;
+  } catch {
+    throw new KvLimitError(`Value "${key}" has invalid metadata.`);
+  }
+}
+
+/**
+ * Pipe chunk streams one after another. The next chunk is opened only after the
+ * previous stream ends, so the isolate never holds the whole object.
+ */
+export function chainChunkStreams(
+  count: number,
+  open: (index: number) => Promise<ReadableStream<Uint8Array> | null>,
+): ReadableStream<Uint8Array> {
+  let index = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  return new ReadableStream({
+    async pull(controller) {
+      while (true) {
+        if (!reader) {
+          if (index >= count) {
+            controller.close();
+            return;
+          }
+          const opened = index;
+          const next = await open(index);
+          index += 1;
+          if (!next) {
+            controller.error(new Error(`Missing binary chunk ${opened}`));
+            return;
+          }
+          reader = next.getReader();
+        }
+        const { done, value } = await reader.read();
+        if (done) {
+          reader.releaseLock();
+          reader = null;
+          continue;
+        }
+        controller.enqueue(value);
+        return;
+      }
+    },
+    cancel(reason) {
+      return reader?.cancel(reason);
+    },
+  });
+}
+
+/** Stream a stored blob. Reads the small meta object, then each chunk as a stream. */
+export async function openByteStream(
+  kv: KvLike,
+  key: string,
+): Promise<{ stream: ReadableStream<Uint8Array>; size: number; contentType: string } | null> {
+  const meta = await readBlobMeta(kv, key);
+  if (!meta) return null;
+  if (meta.encoding !== "bytes") {
+    throw new KvLimitError(`Value "${key}" is not stored as bytes.`);
+  }
+  const stream = chainChunkStreams(meta.chunks, async (i) => {
+    const part = await kv.get(chunkKey(key, i), { type: "stream" });
+    return part instanceof ReadableStream ? part as ReadableStream<Uint8Array> : null;
+  });
+  return { stream, size: meta.size, contentType: meta.contentType || "application/octet-stream" };
+}
+
+/**
+ * Store one body as a single KV value. The body stream is handed to KV as-is.
+ * Callers must not read it. One value cannot exceed the 25 MiB KV limit.
+ */
+export async function putStreamedBytes(
+  kv: KvLike,
+  key: string,
+  body: ReadableStream<Uint8Array>,
+  size: number,
+  contentType: string,
+): Promise<void> {
+  assertObjectSize(size, `Binary value "${key}"`, KV_VALUE_LIMIT);
+  if (size <= 0) throw new KvLimitError(`Binary value "${key}" is empty.`);
+  const previous = await existingChunkCount(kv, key);
+  await kv.put(chunkKey(key, 0), body);
+  const meta: BlobMeta = { chunks: 1, size, encoding: "bytes", contentType };
+  await kv.put(metaKey(key), JSON.stringify(meta));
+  for (let i = 1; i < previous; i++) await kv.delete(chunkKey(key, i));
 }
 
 export async function getBytes(kv: KvLike, key: string): Promise<{ bytes: Uint8Array; contentType: string } | null> {

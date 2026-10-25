@@ -1,4 +1,5 @@
-import { assertPanoramaBytes, buildRenderSupply, inlineAssetRefs, storeAsset } from "./assets.ts";
+import { assertAssetsPresent, assertPanoramaBytes, inlineAssetRefs, storeAsset } from "./assets.ts";
+import { logStage } from "./log.ts";
 import { findGradientPreset, backupSchema, describeOptions } from "./schema.ts";
 import {
   addScreenshot,
@@ -28,14 +29,16 @@ import {
   installProject,
   listProjectIndex,
   modifyProject,
-  putPublicFile,
+  publicFileKey,
+  putStoreZip,
   readProjectDoc,
+  readRenderToken,
   rememberFile,
   withRenderLock,
+  writeRenderToken,
   type ProjectEnvelope,
 } from "./store.ts";
-import { assertRenderedFrames } from "./render.ts";
-import { zipStore } from "./zip.ts";
+import { assertRenderedFrames, parseUploads } from "./render.ts";
 import { KvLimitError } from "./kvblob.ts";
 import type { Services } from "./types.ts";
 
@@ -230,7 +233,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "render_preview",
     description:
-      "Render one screenshot to a PNG at the project's exact output pixel size using the hosted app (2D canvas and three.js). Returns a public URL. Set inline true to also embed the PNG.",
+      "Render one screenshot to a PNG at the project's exact output pixel size. The browser uploads the PNG. Returns a public URL. inline is accepted and ignored: image bytes are not copied back through this Worker.",
     inputSchema: {
       type: "object",
       properties: {
@@ -244,7 +247,8 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "export_project",
-    description: "Render every screenshot to PNG and a ZIP. Returns public unguessable URLs.",
+    description:
+      "Render every screenshot in one browser session. The page uploads each PNG. Returns public PNG URLs and a ZIP URL. The ZIP is uncompressed and streamed on download.",
     inputSchema: {
       type: "object",
       properties: {
@@ -406,30 +410,9 @@ export async function defaultLoadImage(url: string): Promise<{ mime: string; byt
   return { mime, bytes };
 }
 
-async function storeRendered(
-  services: Services,
-  projectId: string,
-  bytes: Uint8Array,
-  contentType: string,
-  filename: string,
-): Promise<string> {
-  const token = randomToken();
-  await putPublicFile(services.env.APPSCREEN_KV, token, bytes, contentType);
-  await rememberFile(services.env.APPSCREEN_KV, projectId, token);
-  const url = new URL(`/f/${token}/${filename}`, services.publicOrigin);
-  return url.toString();
+function publicFileUrl(services: Services, token: string, filename: string): string {
+  return new URL(`/f/${token}/${filename}`, services.publicOrigin).toString();
 }
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const stride = 0x8000;
-  for (let i = 0; i < bytes.length; i += stride) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + stride));
-  }
-  return btoa(binary);
-}
-
-const INLINE_LIMIT = 4 * 1024 * 1024;
 
 export async function callTool(services: Services, name: string, args: Record<string, unknown>): Promise<ToolSuccess> {
   switch (name) {
@@ -608,24 +591,19 @@ export async function callTool(services: Services, name: string, args: Record<st
       }
       const shots = await renderProject(services, envelope, backup, [index]);
       const shot = shots[0];
-      const url = await storeRendered(services, envelope.id, shot.png, "image/png", `screenshot-${index + 1}.png`);
       const data: Record<string, unknown> = {
         project_id: envelope.id,
         index,
-        url,
+        url: publicFileUrl(services, shot.token, `screenshot-${index + 1}.png`),
         width: shot.width,
         height: shot.height,
-        bytes: shot.png.byteLength,
+        bytes: shot.bytes,
+        sha256: shot.sha256,
       };
-      const images = [];
       if (args.inline === true) {
-        if (shot.png.byteLength > INLINE_LIMIT) {
-          data.inline_omitted = `PNG is ${shot.png.byteLength} bytes, above the ${INLINE_LIMIT} byte inline limit. Use url.`;
-        } else {
-          images.push({ base64: bytesToBase64(shot.png), mimeType: "image/png" });
-        }
+        data.inline_omitted = "The PNG stays in KV. This Worker does not copy image bytes back into the tool result. Use url.";
       }
-      return { data, images };
+      return { data };
     }
     case "export_project": {
       const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
@@ -635,22 +613,32 @@ export async function callTool(services: Services, name: string, args: Record<st
       }
       const indexes = project.screenshots.map((_, i) => i);
       const shots = await renderProject(services, envelope, backup, indexes);
-      const pngs = [];
-      const zipEntries = [];
-      for (const shot of shots) {
-        const filename = `screenshot-${shot.index + 1}.png`;
-        const url = await storeRendered(services, envelope.id, shot.png, "image/png", filename);
-        pngs.push({ index: shot.index, url, width: shot.width, height: shot.height, bytes: shot.png.byteLength });
-        zipEntries.push({ name: filename, data: shot.png });
-      }
-      const zip = zipStore(zipEntries);
-      const zipUrl = await storeRendered(services, envelope.id, zip, "application/zip", "screenshots.zip");
+      const pngs = shots.map((shot) => ({
+        index: shot.index,
+        url: publicFileUrl(services, shot.token, `screenshot-${shot.index + 1}.png`),
+        width: shot.width,
+        height: shot.height,
+        bytes: shot.bytes,
+        sha256: shot.sha256,
+      }));
+      const zipToken = randomToken();
+      await putStoreZip(
+        services.env.APPSCREEN_KV,
+        zipToken,
+        shots.map((shot) => ({
+          name: `screenshot-${shot.index + 1}.png`,
+          key: publicFileKey(shot.token),
+          crc: shot.crc,
+          size: shot.bytes,
+        })),
+      );
+      await rememberFile(services.env.APPSCREEN_KV, envelope.id, zipToken);
       return {
         data: {
           project_id: envelope.id,
           output: outputSizeOf(project),
           pngs,
-          zip_url: zipUrl,
+          zip_url: publicFileUrl(services, zipToken, "screenshots.zip"),
         },
       };
     }
@@ -672,16 +660,53 @@ async function renderProject(services: Services, envelope: ProjectEnvelope, back
   if (!services.renderScreenshots) {
     throw new ProjectError("render_unavailable", "Browser rendering is not configured.");
   }
-  const url = renderUrl(services, envelope.id, envelope.editKey, indexes.length === 1 ? String(indexes[0]) : "all");
+  const kv = services.env.APPSCREEN_KV;
+  logStage("render_start", { projectId: envelope.id, indexes });
   try {
     return await withRenderLock(services.env, envelope.id, async () => {
-      const supply = await buildRenderSupply(services.env.APPSCREEN_KV, backup);
-      const shots = await services.renderScreenshots!(url, indexes, supply);
+      await assertAssetsPresent(kv, backup);
+      const slots = indexes.map((index) => ({
+        index,
+        token: randomToken(),
+        filename: `screenshot-${index + 1}.png`,
+      }));
+      for (const slot of slots) {
+        await writeRenderToken(kv, slot.token, {
+          projectId: envelope.id,
+          index: slot.index,
+          filename: slot.filename,
+          uploaded: false,
+        });
+      }
+      const page = new URL(renderUrl(services, envelope.id, envelope.editKey, indexes.length === 1 ? String(indexes[0]) : "all"));
+      page.searchParams.set("uploads", slots.map((slot) => `${slot.index}:${slot.token}`).join(","));
+      const issued = parseUploads(page.searchParams.get("uploads"));
+      const frames = await services.renderScreenshots!(page.toString(), indexes);
+      const ordered = indexes.map((index) => {
+        const frame = frames.find((shot) => shot.index === index);
+        if (!frame || frame.token !== issued.get(index)) {
+          throw new ProjectError("render_failed", `Screenshot ${index} did not upload.`);
+        }
+        return frame;
+      });
       const sources = renderSourceKeys(backup);
-      await assertRenderedFrames(shots, indexes.map((index) => sources[index] || { image: "", panorama: false }));
-      return shots;
+      assertRenderedFrames(ordered, indexes.map((index) => sources[index] || { image: "", panorama: false }));
+      for (const frame of ordered) {
+        const record = await readRenderToken(kv, frame.token);
+        if (!record?.uploaded || record.sha256 !== frame.sha256 || record.bytes !== frame.bytes || record.crc !== frame.crc) {
+          throw new ProjectError("render_failed", `Screenshot ${frame.index} did not upload.`);
+        }
+        await rememberFile(kv, envelope.id, frame.token);
+      }
+      logStage("render_done", { projectId: envelope.id, indexes, bytes: ordered.map((frame) => frame.bytes) });
+      return ordered;
     });
   } catch (error) {
+    if (!(error instanceof ProjectError)) {
+      logStage("render_error", { projectId: envelope.id, message: error instanceof Error ? error.message : String(error) });
+    } else if (error.code !== "render_busy") {
+      logStage("render_error", { projectId: envelope.id, message: error.message });
+    }
     if (error instanceof ProjectError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new ProjectError("render_failed", message);

@@ -101,13 +101,14 @@ CORS allows `https://matinrahimik.github.io` and `http://localhost` / `http://12
 | --- | --- | --- | --- |
 | `GET` | `/api/projects/:id` | `X-Edit-Key` or MCP bearer | — |
 | `PUT` | `/api/projects/:id` | `X-Edit-Key` or MCP bearer | backup JSON |
-| `GET` | `/assets/:sha256` | none (content hash) | image bytes, CORS for Pages and localhost |
-| `GET` | `/f/:token/:filename` | none (unguessable token) | PNG or ZIP bytes |
+| `GET` | `/assets/:sha256` | none (content hash) | streamed image bytes, long immutable cache, CORS for Pages and localhost |
+| `PUT` | `/renders/:token` | one-time upload token | streamed PNG body, stored without decoding |
+| `GET` | `/f/:token/:filename` | none (unguessable token) | streamed PNG, or a STORE ZIP assembled while downloading |
 | `POST` | `/mcp` | MCP bearer | JSON-RPC |
 
 `GET /api/projects/:id` returns the backup JSON with image fields rewritten to `https://<worker>/assets/<sha256>` so the editor does not download or upload the pixels on a settings change. The response is `cache-control: no-store`. `PUT` accepts those URLs, `asset:<sha256>` refs, or a self-contained backup whose images are still data URLs. `get_project` with `include_backup: true` returns the original self-contained Export/Import backup.
 
-`render_preview` and `export_project` do not ask Browser Rendering to fetch those asset URLs. The Worker reads the blobs from KV, inlines them into the backup, and fulfills the page's project and `/assets` requests from that memory. One render runs at a time per project. A render that fails closes the browser session instead of leaving it for the next call.
+`render_preview` and `export_project` do not read image bytes. The browser loads each asset with `GET /assets/<hash>` (its own Worker invocation streams the KV value) and uploads each finished PNG with `PUT /renders/<token>`. The orchestrating call only waits for a small `done` signal. One render runs at a time per project. A render that fails closes the browser session. A session that disconnected cleanly can be reused.
 
 The on-disk shape the app exports is still:
 
@@ -135,22 +136,20 @@ https://matinrahimik.github.io/homebooks-appscreen/?project=PROJECT_ID&key=EDIT_
 
 Optional `api` overrides the Worker origin (default `https://homebooks-appscreen-mcp.matinrahimi.workers.dev`). Edits are saved about 800ms after the last change. Without `project` and `key`, the app stays on local IndexedDB only.
 
-Headless mode adds `render`:
+Headless mode adds `render` and `uploads`:
 
 ```
-?project=PROJECT_ID&key=EDIT_KEY&render=0
-?project=PROJECT_ID&key=EDIT_KEY&render=all
+?project=PROJECT_ID&key=EDIT_KEY&render=0&uploads=0:TOKEN
+?project=PROJECT_ID&key=EDIT_KEY&render=all&uploads=0:TOKEN,1:TOKEN
 ```
 
-The sidebars are hidden. The preview canvas is the export pixel size (not the on-screen preview scale). When drawing finishes (images, fonts, and the three.js device model when 3D is on):
+The sidebars are hidden. The preview canvas is the export pixel size (not the on-screen preview scale). Each asset is loaded from `GET /assets/<hash>`. A failed image (`naturalWidth === 0` or `decode()` rejecting) is retried inside the page, then the error names the asset hash. The page encodes the canvas with `canvas.toBlob`, computes crc32 and sha256, and `PUT`s the blob to `/renders/<token>`.
 
-- `document.documentElement.dataset.appscreenStatus` is `ready` or `error`
-- `window.__appscreenReady === true`
-- `await window.__appscreen.capture(index)` resolves to `{ index, width, height, dataUrl }`
-- `await window.__appscreen.captureAll()` captures every screenshot
-- `window.__appscreen.getCanvas()` is the `#preview-canvas` element
+- `document.documentElement.dataset.appscreenStatus` is `done` or `error`
+- `dataset.appscreenResult` is a small JSON object `{ shots: [...] }` with index, token, width, height, bytes, sha256, and crc. It does not contain pixels.
+- `window.__appscreen.capture(index)` still returns a data URL for local debugging when `uploads` is absent
 
-`render_preview` and `export_project` open that URL with `@cloudflare/puppeteer` and read `capture()`, so server output matches the editor.
+`render_preview` and `export_project` open that URL and wait until the status is `done`. They never call `setRequestInterception` and never receive the PNG.
 
 Assets are relative. On the project site, `index.html` sets `<base href="/homebooks-appscreen/">` so `models/*.glb` and `img/*` load under the Pages subpath. Local `python3 -m http.server` keeps base `/`.
 
@@ -377,7 +376,7 @@ Width and height must be between 100 and 4000.
 { "project_id": "PROJECT_ID", "index": 0, "inline": false }
 ```
 
-Returns `url`, `width`, `height`. `inline: true` also adds an MCP image block when the PNG is under 4 MiB.
+Returns `url`, `width`, `height`, `bytes`, and `sha256`. `inline: true` is accepted and ignored: the PNG is not copied back through the Worker. Fetch `url`.
 
 ### export_project
 
@@ -385,7 +384,7 @@ Returns `url`, `width`, `height`. `inline: true` also adds an MCP image block wh
 { "project_id": "PROJECT_ID" }
 ```
 
-Returns `pngs[]` (one public URL each) and `zip_url`.
+Returns `pngs[]` (one public URL each) and `zip_url`. The ZIP is not built in the render invocation. `GET` of `zip_url` streams an uncompressed ZIP from the uploaded PNGs and the crc32 values the page already computed.
 
 ### get_schema
 
@@ -397,9 +396,10 @@ Returns `pngs[]` (one public URL each) and `zip_url`.
 
 ## Caveats
 
-- **Browser Rendering on the Workers Free plan** is capped at [10 minutes of browser time per UTC day](https://developers.cloudflare.com/browser-run/limits/). Over the cap, new sessions fail with HTTP 429 until the next UTC day. Paid plans have a higher allowance. Each preview or export launches a browser, loads the Pages app, the 3D model (when needed), and Google Fonts.
-- Rendering does nothing useful until the Pages site is deployed and Browser Rendering is enabled. The Worker and the Pages origin must both be public so the headless browser can load the app and the app can fetch the project.
-- KV is eventually consistent and each value is at most 25 MiB. Image blobs and exports are chunked, then rejected above 80 MiB. The project document itself stays small. Writes to one project are serialized by a Durable Object (`ProjectGate`) with compare-and-swap, so parallel `add_screenshot` calls do not drop screenshots or tear chunk metadata. This is not a substitute for object storage.
+- **Workers Free is still not a reliable place to iterate on a real project.** This path keeps image bytes out of the orchestrating isolate: asset `GET`s stream from KV, the page uploads each PNG, and the ZIP is streamed on download. That removes the failure where one invocation base64'd every screenshot and pushed it through CDP (`error code: 1102`, or `Too many API requests by single Worker invocation`). It does not remove the Free plan caps. Worker CPU is about 10 ms per invocation and memory is 128 MB, so any future code that buffers or decodes a multi-megabyte image in that invocation will 1102 again. Subrequests are capped at 50; this call does not intercept page requests and does not retry a 429 in a loop (at most two browser launches, then `retry-after`). Browser Rendering on Free is about 10 minutes per UTC day, 3 concurrent browsers, and one new browser every 20 seconds, with a 60 second inactivity timeout. A 6-screenshot 3D export of multi-megabyte PNGs plus a panorama can spend a large part of that daily 10 minutes and can be killed if it runs long. Reusing a healthy session avoids the new-browser rate. A failed render closes the session.
+- **Workers Paid** is what makes repeated exports of that project reliable. CPU goes from about 10 ms to a 30 second default (configurable up to 5 minutes). Subrequests go from 50 to a default of 10,000. Browser Rendering drops the 10 minute/day cap (usage is billed; the plan has included browser hours, then a per-hour charge) and raises concurrency and the new-browser rate. Paid does not remove the 60 second inactivity timeout; `keep_alive` can extend an idle session. Paid does not make it safe to copy image bytes through the isolate again.
+- Rendering does nothing useful until the Pages site is deployed and Browser Rendering is enabled. The Worker and the Pages origin must both be public so the headless browser can load the app, fetch `/assets`, and `PUT /renders`.
+- KV is eventually consistent and each value is at most 25 MiB. Image blobs written by the tools are chunked, then rejected above 80 MiB. A rendered PNG is streamed into one KV value, so a single upload above 25 MiB is rejected without being read. The project document itself stays small. Writes to one project are serialized by a Durable Object (`ProjectGate`) with compare-and-swap, so parallel `add_screenshot` calls do not drop screenshots or tear chunk metadata. This is not a substitute for object storage.
 - The edit URL is a capability link. Anyone with `project` and `key` can read and overwrite that project. It is not the MCP token. The token can read and write every project.
 - Last write wins between the agent and the open editor. The editor does not live-reload remote changes until the page is opened again.
 - Noise overlay uses `Math.random`, so those frames are not pixel-stable between renders.

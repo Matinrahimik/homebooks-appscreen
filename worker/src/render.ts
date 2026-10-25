@@ -1,5 +1,5 @@
-import type { RenderSupply } from "./assets.ts";
-import type { RenderShot } from "./types.ts";
+import { logStage } from "./log.ts";
+import type { RenderedFrame } from "./types.ts";
 
 interface BrowserEnv {
   BROWSER?: unknown;
@@ -15,26 +15,12 @@ export interface BrowserLimits {
   timeUntilNextAllowedBrowserAcquisition?: number;
 }
 
-interface InterceptedRequest {
-  url(): string;
-  continue(): Promise<void>;
-  respond(response: {
-    status: number;
-    contentType?: string;
-    headers?: Record<string, string>;
-    body?: string | Uint8Array | Buffer;
-  }): Promise<void>;
-  abort?(reason?: string): Promise<void>;
-}
-
 interface BrowserPage {
   setViewport(viewport: { width: number; height: number; deviceScaleFactor: number }): Promise<unknown>;
   setCacheEnabled?(enabled: boolean): Promise<void>;
-  setRequestInterception?(value: boolean): Promise<void>;
-  on?(event: "request", handler: (request: InterceptedRequest) => void | Promise<void>): void;
   goto(url: string, options: { waitUntil: string; timeout: number }): Promise<unknown>;
   waitForFunction(fn: () => boolean, options: { timeout: number }): Promise<unknown>;
-  evaluate<T>(fn: (...args: never[]) => T, arg?: unknown): Promise<T>;
+  evaluate<T>(fn: (...args: never[]) => T): Promise<T>;
   close?: () => Promise<void>;
 }
 
@@ -51,13 +37,14 @@ export interface PuppeteerBinding {
   limits?(endpoint: unknown): Promise<BrowserLimits>;
 }
 
-/** How long a disconnected session stays available for the next render. Milliseconds. */
+/** How long a disconnected healthy session stays available for the next render. */
 export const BROWSER_KEEP_ALIVE_MS = 180_000;
 
-/** Backoff used when the account does not say how long the new-browser limit lasts. */
-export const BROWSER_RETRY_DELAYS_MS = [2_000, 8_000];
+/** Launch attempts per call. A 429 does not sleep and does not loop. */
+export const BROWSER_LAUNCH_ATTEMPTS = 2;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Shared budget for navigation and the upload wait. Under the 60s browser idle timeout. */
+export const RENDER_WALL_MS = 50_000;
 
 export function isBrowserRateLimit(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -83,7 +70,7 @@ export function browserRateLimitError(cause: unknown, limits?: BrowserLimits | n
     ? " If the message is the free-plan daily browser-time cap, retry after that allowance resets."
     : "";
   return new Error(
-    `Browser Rendering rate limit: ${raw}. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A free session is reused when one is still alive, and every screenshot in one call shares that browser.${daily}`,
+    `Browser Rendering rate limit: ${raw}. retry-after: ${seconds} seconds. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A healthy disconnected session is reused. A failed render closes its session.${daily}`,
   );
 }
 
@@ -99,7 +86,7 @@ async function connectFreeSession(puppeteer: PuppeteerBinding, endpoint: unknown
     try {
       return await puppeteer.connect(endpoint, session.sessionId);
     } catch {
-      /* Session was taken or is not ready. Try the next one, then launch. */
+      /* Session was taken or is not healthy. Try the next one, then launch. */
     }
   }
   return null;
@@ -114,39 +101,43 @@ async function readLimits(puppeteer: PuppeteerBinding, endpoint: unknown): Promi
   }
 }
 
-function retryDelay(attempt: number, limits: BrowserLimits | null): number {
-  const indicated = acquisitionWaitMs(limits?.timeUntilNextAllowedBrowserAcquisition);
-  if (indicated == null) return BROWSER_RETRY_DELAYS_MS[attempt] ?? 8_000;
-  return Math.min(Math.max(indicated, 250), 15_000);
-}
-
 /**
- * Reuse a Browser Rendering session that no longer has a worker attached.
- * Launching a new browser is the fallback, with keep-alive so the next tool
- * call can connect instead of hitting the per-minute new-browser limit.
+ * Reuse a session that disconnected cleanly. Otherwise launch, at most twice.
+ * There is no sleep loop: a 429 reads the limit once, reuses a free session if
+ * one appeared, and otherwise returns retry-after. A second launch happens only
+ * when the account still allows an acquisition.
  */
 export async function acquireBrowser(
   puppeteer: PuppeteerBinding,
   endpoint: unknown,
-  wait: (ms: number) => Promise<void> = sleep,
+  _wait: (ms: number) => Promise<void> = () => Promise.resolve(),
 ): Promise<BrowserHandle> {
   const existing = await connectFreeSession(puppeteer, endpoint);
-  if (existing) return existing;
+  if (existing) {
+    logStage("browser_acquired", { reused: true });
+    return existing;
+  }
 
   let lastError: unknown;
   let lastLimits: BrowserLimits | null = null;
-  const attempts = BROWSER_RETRY_DELAYS_MS.length + 1;
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  for (let attempt = 0; attempt < BROWSER_LAUNCH_ATTEMPTS; attempt++) {
     try {
-      return await puppeteer.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
+      const handle = await puppeteer.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
+      logStage("browser_acquired", { reused: false, attempt });
+      return handle;
     } catch (error) {
       lastError = error;
       if (!isBrowserRateLimit(error)) throw error;
       lastLimits = await readLimits(puppeteer, endpoint);
-      if (attempt === attempts - 1) throw browserRateLimitError(error, lastLimits);
-      await wait(retryDelay(attempt, lastLimits));
       const freed = await connectFreeSession(puppeteer, endpoint);
-      if (freed) return freed;
+      if (freed) {
+        logStage("browser_acquired", { reused: true, attempt });
+        return freed;
+      }
+      const allowed = lastLimits?.allowedBrowserAcquisitions ?? 0;
+      if (allowed <= 0 || attempt === BROWSER_LAUNCH_ATTEMPTS - 1) {
+        throw browserRateLimitError(error, lastLimits);
+      }
     }
   }
   throw browserRateLimitError(lastError, lastLimits);
@@ -164,44 +155,17 @@ export async function releaseBrowser(browser: BrowserHandle, discard = false): P
   if (typeof browser.close === "function") await browser.close();
 }
 
-export type FulfillDecision =
-  | { kind: "continue" }
-  | { kind: "missing"; url: string }
-  | { kind: "respond"; status: number; contentType: string; body: Uint8Array | string; headers: Record<string, string> };
-
-/** Answer the render page's project and asset fetches from memory. Everything else uses the network. */
-export function fulfillRenderRequest(rawUrl: string, supply: RenderSupply): FulfillDecision {
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return { kind: "continue" };
+export function parseUploads(value: string | null | undefined): Map<number, string> {
+  const slots = new Map<number, string>();
+  for (const part of String(value || "").split(",")) {
+    const splitAt = part.indexOf(":");
+    if (splitAt <= 0) continue;
+    const index = part.slice(0, splitAt);
+    const token = part.slice(splitAt + 1);
+    if (!/^\d+$/.test(index) || !/^[a-f0-9]{64}$/i.test(token)) continue;
+    slots.set(Number(index), token.toLowerCase());
   }
-  if (/\/api\/projects\/[^/]+$/.test(url.pathname)) {
-    return {
-      kind: "respond",
-      status: 200,
-      contentType: "application/json; charset=utf-8",
-      body: supply.projectBody,
-      headers: { "cache-control": "no-store" },
-    };
-  }
-  const asset = url.pathname.match(/\/assets\/([a-f0-9]{64})$/i);
-  if (!asset) return { kind: "continue" };
-  const blob = supply.assets.get(asset[1].toLowerCase());
-  if (!blob) return { kind: "missing", url: rawUrl };
-  return {
-    kind: "respond",
-    status: 200,
-    contentType: blob.mime,
-    body: blob.bytes,
-    headers: { "cache-control": "no-store" },
-  };
-}
-
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return slots;
 }
 
 export interface CaptureSource {
@@ -211,15 +175,16 @@ export interface CaptureSource {
 
 /**
  * Identical PNGs are the export failure mode: every index captured the gradient
- * before its photo or panorama decoded. Matching frames are allowed when they
- * really share one image and there is no panorama to slice.
+ * before its photo or panorama decoded. The page reports sha256; this does not
+ * hash image bytes. Matching frames are allowed when they really share one image
+ * and there is no panorama to slice.
  */
-export async function assertRenderedFrames(
-  shots: { index: number; png: Uint8Array }[],
+export function assertRenderedFrames(
+  shots: { index: number; sha256: string }[],
   sources: CaptureSource[],
-): Promise<void> {
+): void {
   if (shots.length < 2) return;
-  const hashes = await Promise.all(shots.map((shot) => sha256Hex(shot.png)));
+  const hashes = shots.map((shot) => shot.sha256);
   const allSame = hashes.every((hash) => hash === hashes[0]);
   const distinctImages = new Set(sources.map((source) => source.image).filter(Boolean));
   const panorama = sources.some((source) => source.panorama);
@@ -248,126 +213,119 @@ export async function assertRenderedFrames(
 interface RenderHooks {
   puppeteer?: PuppeteerBinding;
   sleep?: (ms: number) => Promise<void>;
-  /** When set, project JSON and /assets are answered from KV bytes. No loopback. */
-  supply?: RenderSupply;
 }
 
-/**
- * Open the hosted Pages app in render mode and read each finished canvas
- * at its real output pixel size via window.__appscreen.capture().
- * Every index is captured in the same browser session.
- */
-function respondBody(body: Uint8Array | string): string | Buffer {
-  if (typeof body === "string") return body;
-  return Buffer.from(body);
+interface PageShot {
+  index?: number;
+  token?: string;
+  width?: number;
+  height?: number;
+  bytes?: number;
+  sha256?: string;
+  crc?: number;
 }
 
-async function installSupply(page: BrowserPage, supply: RenderSupply): Promise<() => string> {
-  if (!page.setRequestInterception || !page.on) {
-    throw new Error("This browser cannot intercept asset requests, so render would loop back to /assets and can capture a broken frame.");
+function frameFromPage(shot: PageShot | undefined, index: number, token: string): RenderedFrame {
+  if (!shot || shot.index !== index || String(shot.token || "").toLowerCase() !== token) {
+    throw new Error(`Screenshot ${index} did not upload.`);
   }
-  let interceptError = "";
-  await page.setRequestInterception(true);
-  page.on("request", async (request) => {
-    try {
-      const decision = fulfillRenderRequest(request.url(), supply);
-      if (decision.kind === "continue") {
-        await request.continue();
-        return;
-      }
-      if (decision.kind === "missing") {
-        interceptError = `Render asset failed to load: ${decision.url}`;
-        await request.respond({ status: 404, contentType: "text/plain", body: interceptError, headers: { "cache-control": "no-store" } });
-        return;
-      }
-      await request.respond({
-        status: decision.status,
-        contentType: decision.contentType,
-        headers: decision.headers,
-        body: respondBody(decision.body),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      interceptError = interceptError || `Render request failed for ${request.url()}: ${message}`;
-      try {
-        await request.abort?.("failed");
-      } catch {
-        /* The page will see the failed asset and refuse to mark ready. */
-      }
-    }
-  });
-  return () => interceptError;
+  if (!Number.isInteger(shot.width) || shot.width <= 0 || !Number.isInteger(shot.height) || shot.height <= 0) {
+    throw new Error(`Screenshot ${index} reported an invalid size.`);
+  }
+  if (!Number.isInteger(shot.bytes) || shot.bytes <= 0) {
+    throw new Error(`Screenshot ${index} reported an empty PNG.`);
+  }
+  if (!/^[a-f0-9]{64}$/i.test(shot.sha256 || "")) {
+    throw new Error(`Screenshot ${index} did not report a sha256.`);
+  }
+  if (!Number.isInteger(shot.crc) || shot.crc < 0 || shot.crc > 0xffffffff) {
+    throw new Error(`Screenshot ${index} did not report a crc32.`);
+  }
+  return {
+    index,
+    token,
+    width: shot.width,
+    height: shot.height,
+    bytes: shot.bytes,
+    sha256: shot.sha256.toLowerCase(),
+    crc: shot.crc >>> 0,
+  };
+}
+
+function remaining(deadline: number): number {
+  return Math.max(1_000, deadline - Date.now());
 }
 
 /**
- * Open a fresh page in render mode and read each finished canvas at its real
- * output pixel size. A failed render closes the browser so the next call does
- * not reconnect to a session whose HTTP cache or IndexedDB is poisoned.
+ * Open the hosted page and wait until it has uploaded each PNG. The return
+ * value is the small done JSON. Screenshot bytes never enter this isolate.
+ * A failed render closes the browser so the next call does not reuse it.
  */
 export async function renderScreenshots(
   env: BrowserEnv,
   pageUrl: string,
   indices: number[],
   hooks?: RenderHooks,
-): Promise<RenderShot[]> {
+): Promise<RenderedFrame[]> {
   if (!env.BROWSER && !hooks?.puppeteer) {
     throw new Error("Browser Rendering binding BROWSER is not configured.");
   }
+  const uploads = parseUploads(new URL(pageUrl).searchParams.get("uploads"));
+  for (const index of indices) {
+    if (!uploads.get(index)) throw new Error(`Screenshot ${index} has no upload token.`);
+  }
   const puppeteer = hooks?.puppeteer ?? ((await import("@cloudflare/puppeteer")).default as PuppeteerBinding);
   const browser = await acquireBrowser(puppeteer, env.BROWSER, hooks?.sleep);
+  const deadline = Date.now() + RENDER_WALL_MS;
   let page: BrowserPage | undefined;
   let discard = false;
   try {
     page = await browser.newPage();
     await page.setViewport({ width: 900, height: 900, deviceScaleFactor: 1 });
     if (page.setCacheEnabled) await page.setCacheEnabled(false);
-    const interceptionError = hooks?.supply ? await installSupply(page, hooks.supply) : null;
     const opened = new URL(pageUrl);
     opened.searchParams.set("cb", String(Date.now()));
-    await page.goto(opened.toString(), { waitUntil: "networkidle0", timeout: 90_000 });
-    if (interceptionError) {
-      const missed = interceptionError();
-      if (missed) throw new Error(missed);
+    try {
+      await page.goto(opened.toString(), { waitUntil: "networkidle0", timeout: remaining(deadline) });
+      logStage("page_opened", { indexes: indices });
+      await page.waitForFunction(
+        () => {
+          const status = document.documentElement.dataset.appscreenStatus;
+          return status === "done" || status === "error";
+        },
+        { timeout: remaining(deadline) },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timeout|timed out/i.test(message)) {
+        throw new Error(
+          `Render timed out after ${RENDER_WALL_MS}ms. The page did not finish uploading. On the Workers Free plan a browser session is short, and a multi-screenshot 3D export can exceed it.`,
+        );
+      }
+      throw error;
     }
-    await page.waitForFunction(
-      () => {
-        const status = document.documentElement.dataset.appscreenStatus;
-        return status === "ready" || status === "error";
-      },
-      { timeout: 90_000 },
-    );
-    const status = await page.evaluate(() => ({
+    const reported = await page.evaluate(() => ({
       status: document.documentElement.dataset.appscreenStatus || "",
-      error: document.documentElement.dataset.appscreenError || (window as unknown as { __appscreenError?: string }).__appscreenError || "",
+      error: document.documentElement.dataset.appscreenError || "",
+      result: document.documentElement.dataset.appscreenResult || "",
     }));
-    if (interceptionError) {
-      const missed = interceptionError();
-      if (missed) throw new Error(missed);
+    if (reported.status === "error") {
+      throw new Error(reported.error || "Headless render failed in the Pages app.");
     }
-    if (status.status === "error") {
-      throw new Error(status.error || "Headless render failed in the Pages app.");
+    if (reported.status !== "done") {
+      throw new Error(`Render page finished as "${reported.status || "empty"}" without uploading.`);
     }
-    const shots = await page.evaluate(async (wanted: number[]) => {
-      const hook = (window as unknown as {
-        __appscreen?: {
-          capture: (index: number) => Promise<{ index: number; width: number; height: number; dataUrl: string }>;
-        };
-      }).__appscreen;
-      if (!hook) throw new Error("window.__appscreen is missing.");
-      const out = [];
-      for (const index of wanted) out.push(await hook.capture(index));
-      return out;
-    }, indices);
-    return shots.map((shot) => {
-      const match = /^data:image\/png;base64,(.+)$/i.exec(shot.dataUrl || "");
-      if (!match) throw new Error(`Screenshot ${shot.index} did not return a PNG data URL.`);
-      const binary = atob(match[1]);
-      const png = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) png[i] = binary.charCodeAt(i);
-      return { index: shot.index, png, width: shot.width, height: shot.height };
-    });
+    let parsed: { shots?: PageShot[] };
+    try {
+      parsed = JSON.parse(reported.result || "{}") as { shots?: PageShot[] };
+    } catch {
+      throw new Error("Render page returned a result that was not JSON.");
+    }
+    const shots = parsed.shots || [];
+    return indices.map((index) => frameFromPage(shots.find((shot) => shot.index === index), index, uploads.get(index)!));
   } catch (error) {
     discard = true;
+    logStage("render_error", { message: error instanceof Error ? error.message : String(error), indexes: indices });
     throw error;
   } finally {
     if (page?.close) {
