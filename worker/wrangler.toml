@@ -17,3 +17,11 @@ id = "__KV_NAMESPACE_ID__"
 [vars]
 PAGES_ORIGIN = "https://matinrahimik.github.io"
 PAGES_PATH = "/homebooks-appscreen/"
+
+[[durable_objects.bindings]]
+name = "PROJECT_GATE"
+class_name = "ProjectGate"
+
+[[migrations]]
+tag = "v1-project-gate"
+new_sqlite_classes = ["ProjectGate"]

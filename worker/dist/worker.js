@@ -2365,12 +2365,12 @@ var require_common = __commonJS({
         newDebug.log = this.log;
         return newDebug;
       }
-      function enable(namespaces) {
-        createDebug.save(namespaces);
-        createDebug.namespaces = namespaces;
+      function enable(namespaces2) {
+        createDebug.save(namespaces2);
+        createDebug.namespaces = namespaces2;
         createDebug.names = [];
         createDebug.skips = [];
-        const split = (typeof namespaces === "string" ? namespaces : "").trim().replace(/\s+/g, ",").split(",").filter(Boolean);
+        const split = (typeof namespaces2 === "string" ? namespaces2 : "").trim().replace(/\s+/g, ",").split(",").filter(Boolean);
         for (const ns of split) {
           if (ns[0] === "-") {
             createDebug.skips.push(ns.slice(1));
@@ -2408,12 +2408,12 @@ var require_common = __commonJS({
         return templateIndex === template.length;
       }
       function disable() {
-        const namespaces = [
+        const namespaces2 = [
           ...createDebug.names,
           ...createDebug.skips.map((namespace) => "-" + namespace)
         ].join(",");
         createDebug.enable("");
-        return namespaces;
+        return namespaces2;
       }
       function enabled(name) {
         for (const skip of createDebug.skips) {
@@ -2575,10 +2575,10 @@ var require_browser = __commonJS({
     }
     exports.log = console.debug || console.log || (() => {
     });
-    function save(namespaces) {
+    function save(namespaces2) {
       try {
-        if (namespaces) {
-          exports.storage.setItem("debug", namespaces);
+        if (namespaces2) {
+          exports.storage.setItem("debug", namespaces2);
         } else {
           exports.storage.removeItem("debug");
         }
@@ -20505,7 +20505,6 @@ function canWriteProject(request, env, editKey) {
 var KV_VALUE_LIMIT = 25 * 1024 * 1024;
 var CHUNK_BYTES = 8 * 1024 * 1024;
 var MAX_OBJECT_BYTES = 80 * 1024 * 1024;
-var CHUNK_CHARS = 4e6;
 var KvLimitError = class extends Error {
   code = "kv_limit";
   constructor(message) {
@@ -20535,34 +20534,20 @@ function chunkBytes(bytes, chunkSize = CHUNK_BYTES) {
   }
   return out;
 }
-function chunkString(value, maxChars = CHUNK_CHARS) {
-  if (value.length === 0) return [""];
-  const out = [];
-  for (let i = 0; i < value.length; i += maxChars) {
-    out.push(value.slice(i, i + maxChars));
-  }
-  return out;
-}
 function metaKey(key) {
   return `${key}:meta`;
 }
+async function existingChunkCount(kv, key) {
+  const raw = await kv.get(metaKey(key), { type: "text" });
+  if (typeof raw !== "string" || !raw) return 0;
+  try {
+    return Number(JSON.parse(raw).chunks) || 0;
+  } catch {
+    return 0;
+  }
+}
 function chunkKey(key, index) {
   return `${key}:c:${index}`;
-}
-async function putText(kv, key, value, maxBytes = MAX_OBJECT_BYTES, maxChars = CHUNK_CHARS) {
-  const size = new TextEncoder().encode(value).byteLength;
-  assertObjectSize(size, `Text value "${key}"`, maxBytes);
-  const parts = chunkString(value, maxChars);
-  for (const part of parts) {
-    if (new TextEncoder().encode(part).byteLength >= KV_VALUE_LIMIT) {
-      throw new KvLimitError(`A text chunk of "${key}" still exceeds the 25 MiB KV value limit.`);
-    }
-  }
-  const meta = { chunks: parts.length, size, encoding: "text" };
-  await kv.put(metaKey(key), JSON.stringify(meta));
-  for (let i = 0; i < parts.length; i++) {
-    await kv.put(chunkKey(key, i), parts[i]);
-  }
 }
 async function getText(kv, key) {
   const raw = await kv.get(metaKey(key), { type: "text" });
@@ -20584,6 +20569,10 @@ async function getText(kv, key) {
 async function putBytes(kv, key, bytes, contentType, maxBytes = MAX_OBJECT_BYTES, chunkSize = CHUNK_BYTES) {
   assertObjectSize(bytes.byteLength, `Binary value "${key}"`, maxBytes);
   const parts = chunkBytes(bytes, chunkSize);
+  const previous = await existingChunkCount(kv, key);
+  for (let i = 0; i < parts.length; i++) {
+    await kv.put(chunkKey(key, i), parts[i]);
+  }
   const meta = {
     chunks: parts.length,
     size: bytes.byteLength,
@@ -20591,9 +20580,7 @@ async function putBytes(kv, key, bytes, contentType, maxBytes = MAX_OBJECT_BYTES
     contentType
   };
   await kv.put(metaKey(key), JSON.stringify(meta));
-  for (let i = 0; i < parts.length; i++) {
-    await kv.put(chunkKey(key, i), parts[i]);
-  }
+  for (let i = parts.length; i < previous; i++) await kv.delete(chunkKey(key, i));
 }
 async function getBytes(kv, key) {
   const raw = await kv.get(metaKey(key), { type: "text" });
@@ -20698,7 +20685,9 @@ function defaultBackground() {
 function defaultScreenshotSettings() {
   return {
     scale: 70,
-    y: 60,
+    // 100 keeps a scale-70 device below a two-line headline and the subheadline.
+    // At this scale the device top is (y / 100) * 30% of the canvas height.
+    y: 100,
     x: 50,
     rotation: 0,
     perspective: 0,
@@ -20735,6 +20724,8 @@ function defaultText() {
     textGapUnit: "px",
     headlineLetterSpacing: 0,
     subheadlineLetterSpacing: 0,
+    headlineTextWrap: "wrap",
+    subheadlineTextWrap: "wrap",
     subheadlineEnabled: false,
     subheadlines: { en: "" },
     subheadlineLanguages: ["en"],
@@ -21035,11 +21026,32 @@ var TEXT_SHORTCUTS = [
   "textGapUnit",
   "headlineLetterSpacing",
   "subheadlineLetterSpacing",
+  "headlineTextWrap",
+  "subheadlineTextWrap",
   "perLanguageLayout",
   "languageSettings",
   "headlines",
   "subheadlines"
 ];
+var LAYOUT_WRITE_KEYS = ["headlineSize", "subheadlineSize", "position", "offsetY", "lineHeight"];
+function applyEffectiveLayout(text, settings, lang) {
+  const patch = {};
+  for (const key of LAYOUT_WRITE_KEYS) {
+    if (settings[key] !== void 0) patch[key] = settings[key];
+  }
+  if (Object.keys(patch).length === 0) return;
+  const active = lang || "en";
+  const current = isPlainObject(text.languageSettings) ? { ...text.languageSettings } : {};
+  const write = (code) => {
+    const prev = isPlainObject(current[code]) ? { ...current[code] } : {};
+    current[code] = { ...prev, ...patch };
+  };
+  write(active);
+  if (text.perLanguageLayout !== true) {
+    for (const code of Object.keys(current)) write(code);
+  }
+  text.languageSettings = current;
+}
 function applyTextShortcuts(text, settings, lang) {
   if (typeof settings.headline === "string") {
     const headlines = { ...text.headlines || {} };
@@ -21063,9 +21075,14 @@ function applyTextShortcuts(text, settings, lang) {
   if (isPlainObject(settings.subheadlines)) text.subheadlines = { ...text.subheadlines, ...settings.subheadlines };
   for (const key of TEXT_SHORTCUTS) {
     if (key === "headline" || key === "subheadline" || key === "headlines" || key === "subheadlines") continue;
+    if (key === "languageSettings") continue;
     if (FONT_ALIAS_KEYS.has(key)) continue;
     if (settings[key] !== void 0) text[key] = settings[key];
   }
+  if (isPlainObject(settings.languageSettings)) {
+    text.languageSettings = deepMerge(text.languageSettings || {}, settings.languageSettings);
+  }
+  applyEffectiveLayout(text, settings, lang);
   if (typeof settings.font === "string" && settings.headlineFont === void 0) {
     text.headlineFont = fontValue(settings.font);
   }
@@ -21155,7 +21172,13 @@ function applyLayerSettings(layer, settings, lang) {
     if (preset) applyPositionPreset(layer.screenshot, preset);
   }
   if (isPlainObject(normalized.text)) {
-    layer.text = deepMerge(layer.text, normalized.text);
+    const textPatch = normalized.text;
+    const stored = { ...textPatch };
+    for (const key of FONT_ALIAS_KEYS) delete stored[key];
+    delete stored.headline;
+    delete stored.subheadline;
+    layer.text = deepMerge(layer.text, stored);
+    applyTextShortcuts(layer.text, textPatch, lang);
   }
   if (typeof normalized.positionPreset === "string") {
     applyPositionPreset(layer.screenshot, normalized.positionPreset);
@@ -21168,43 +21191,204 @@ function applyLayerSettings(layer, settings, lang) {
     layer.popouts = normalized.popouts;
   }
 }
-var RESERVED_GLOBAL = /* @__PURE__ */ new Set([
-  "screenshots",
-  "id",
-  "formatVersion",
-  "background",
-  "screenshot",
-  "text",
-  "elements",
-  "popouts",
-  "positionPreset",
-  "outputDevice",
-  "customWidth",
-  "customHeight",
-  "panoramicBackground",
-  "panoramic",
-  "font_family",
-  "fontFamily",
-  "font_weight",
-  "fontWeight",
-  "headline_font_family",
-  "subheadline_font_family",
-  "headline_weight",
-  "subheadline_weight",
-  ...TEXT_SHORTCUTS
+var BACKGROUND_KEYS = /* @__PURE__ */ new Set([
+  "type",
+  "gradient",
+  "gradientPreset",
+  "solid",
+  "image",
+  "imageSrc",
+  "imageFit",
+  "imageBlur",
+  "imageOffsetX",
+  "imageOffsetY",
+  "imageScale",
+  "overlayColor",
+  "overlayOpacity",
+  "noise",
+  "noiseIntensity",
+  "image_base64",
+  "image_url"
 ]);
+var SHADOW_KEYS = /* @__PURE__ */ new Set(["enabled", "color", "blur", "opacity", "x", "y"]);
+var FRAME_KEYS = /* @__PURE__ */ new Set(["enabled", "color", "width", "opacity"]);
+var ROTATION_3D_KEYS = /* @__PURE__ */ new Set(["x", "y", "z"]);
+var SCREENSHOT_LAYER_KEYS = /* @__PURE__ */ new Set([
+  "scale",
+  "x",
+  "y",
+  "rotation",
+  "perspective",
+  "cornerRadius",
+  "use3D",
+  "device3D",
+  "rotation3D",
+  "shadow",
+  "frame",
+  "border",
+  "positionPreset",
+  "frameColor"
+]);
+var LAYOUT_KEYS = /* @__PURE__ */ new Set(["headlineSize", "subheadlineSize", "position", "offsetY", "lineHeight"]);
+var PANORAMIC_KEYS = /* @__PURE__ */ new Set(["enabled", "src", "imageSrc", "overlap", "scale", "offsetY"]);
+function textSettingKeys() {
+  return /* @__PURE__ */ new Set([...Object.keys(defaultText()), ...TEXT_SHORTCUTS, ...FONT_ALIAS_KEYS]);
+}
+function globalSettingKeys() {
+  return /* @__PURE__ */ new Set([
+    "language",
+    "width",
+    "height",
+    "apply_to",
+    "name",
+    "outputDevice",
+    "customWidth",
+    "customHeight",
+    "background",
+    "screenshot",
+    "text",
+    "elements",
+    "popouts",
+    "positionPreset",
+    "panoramicBackground",
+    "panoramic",
+    "gradientPreset",
+    "type",
+    "gradient",
+    "background_image_base64",
+    "background_image_url",
+    ...TEXT_SHORTCUTS,
+    ...FONT_ALIAS_KEYS
+  ]);
+}
+function screenshotSettingKeys() {
+  return /* @__PURE__ */ new Set([
+    ...globalSettingKeys(),
+    "deviceType",
+    "src",
+    "localizedImages",
+    "image"
+  ]);
+}
+function rejectUnknown(paths) {
+  if (paths.length === 0) return;
+  const listed = paths.map((path) => `"${path}"`).join(", ");
+  const noun = paths.length === 1 ? "setting" : "settings";
+  throw new ProjectError(
+    "unknown_setting",
+    `Unknown ${noun} ${listed}. Call describe_options for the fields these tools accept. font_family, font_weight, headline, and subheadline apply both under settings.text and at the top level of settings.`
+  );
+}
+function collectUnknown(unknown, path, value, allowed) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) unknown.push(`${path}.${key}`);
+  }
+}
+function assertObject(value, path) {
+  if (!isPlainObject(value)) {
+    throw new ProjectError("invalid_setting", `${path} must be an object.`);
+  }
+  return value;
+}
+function assertKnownSettings(settings, scope) {
+  const normalized = renameColourKeys(settings);
+  const unknown = [];
+  collectUnknown(unknown, "settings", normalized, scope === "global" ? globalSettingKeys() : screenshotSettingKeys());
+  if (normalized.background !== void 0) {
+    const background = assertObject(normalized.background, "settings.background");
+    collectUnknown(unknown, "settings.background", background, BACKGROUND_KEYS);
+    if (background.gradient !== void 0) {
+      const gradient = assertObject(background.gradient, "settings.background.gradient");
+      collectUnknown(unknown, "settings.background.gradient", gradient, /* @__PURE__ */ new Set(["angle", "stops"]));
+      if (gradient.stops !== void 0) {
+        if (!Array.isArray(gradient.stops)) {
+          throw new ProjectError("invalid_setting", "settings.background.gradient.stops must be an array.");
+        }
+        gradient.stops.forEach((stop, index) => {
+          const entry = assertObject(stop, `settings.background.gradient.stops[${index}]`);
+          collectUnknown(unknown, `settings.background.gradient.stops[${index}]`, entry, /* @__PURE__ */ new Set(["color", "position"]));
+        });
+      }
+    }
+  }
+  if (normalized.screenshot !== void 0) {
+    const shot = assertObject(normalized.screenshot, "settings.screenshot");
+    collectUnknown(unknown, "settings.screenshot", shot, SCREENSHOT_LAYER_KEYS);
+    if (shot.shadow !== void 0) {
+      const shadow = assertObject(shot.shadow, "settings.screenshot.shadow");
+      collectUnknown(unknown, "settings.screenshot.shadow", shadow, SHADOW_KEYS);
+    }
+    for (const frameKey of ["frame", "border"]) {
+      if (shot[frameKey] !== void 0) {
+        const frame = assertObject(shot[frameKey], `settings.screenshot.${frameKey}`);
+        collectUnknown(unknown, `settings.screenshot.${frameKey}`, frame, FRAME_KEYS);
+      }
+    }
+    if (shot.rotation3D !== void 0) {
+      const rotation = assertObject(shot.rotation3D, "settings.screenshot.rotation3D");
+      collectUnknown(unknown, "settings.screenshot.rotation3D", rotation, ROTATION_3D_KEYS);
+    }
+  }
+  if (normalized.text !== void 0) {
+    const text = assertObject(normalized.text, "settings.text");
+    collectUnknown(unknown, "settings.text", text, textSettingKeys());
+    if (text.languageSettings !== void 0) {
+      const layouts = assertObject(text.languageSettings, "settings.text.languageSettings");
+      for (const [lang, layout] of Object.entries(layouts)) {
+        const entry = assertObject(layout, `settings.text.languageSettings.${lang}`);
+        collectUnknown(unknown, `settings.text.languageSettings.${lang}`, entry, LAYOUT_KEYS);
+      }
+    }
+  }
+  for (const panoKey of ["panoramic", "panoramicBackground"]) {
+    if (normalized[panoKey] !== void 0) {
+      const pano = assertObject(normalized[panoKey], `settings.${panoKey}`);
+      collectUnknown(unknown, `settings.${panoKey}`, pano, PANORAMIC_KEYS);
+    }
+  }
+  if (normalized.gradient !== void 0) {
+    const gradient = assertObject(normalized.gradient, "settings.gradient");
+    collectUnknown(unknown, "settings.gradient", gradient, /* @__PURE__ */ new Set(["angle", "stops"]));
+  }
+  if (normalized.elements !== void 0 && !Array.isArray(normalized.elements)) {
+    throw new ProjectError("invalid_setting", "settings.elements must be an array.");
+  }
+  if (normalized.popouts !== void 0 && !Array.isArray(normalized.popouts)) {
+    throw new ProjectError("invalid_setting", "settings.popouts must be an array.");
+  }
+  rejectUnknown(unknown);
+  assertWrapSetting(normalized.headlineTextWrap, "settings.headlineTextWrap");
+  assertWrapSetting(normalized.subheadlineTextWrap, "settings.subheadlineTextWrap");
+  if (isPlainObject(normalized.text)) {
+    const text = normalized.text;
+    assertWrapSetting(text.headlineTextWrap, "settings.text.headlineTextWrap");
+    assertWrapSetting(text.subheadlineTextWrap, "settings.text.subheadlineTextWrap");
+  }
+}
+function assertWrapSetting(value, path) {
+  if (value === void 0) return;
+  if (value !== "wrap" && value !== "balance") {
+    throw new ProjectError(
+      "unknown_setting",
+      `Invalid ${path} "${String(value)}". Use "wrap" or "balance".`
+    );
+  }
+}
 function updateGlobalSettings(dump, settings, applyTo = "all") {
+  assertKnownSettings(settings, "global");
   const project = primaryProject(dump);
   const lang = typeof settings.language === "string" ? settings.language : project.currentLanguage || "en";
   if (typeof settings.language === "string") {
     project.currentLanguage = settings.language;
     ensureLanguage(project, settings.language);
   }
-  if (typeof settings.outputDevice === "string" || settings.width || settings.height) {
+  const width = typeof settings.width === "number" ? settings.width : typeof settings.customWidth === "number" ? settings.customWidth : void 0;
+  const height = typeof settings.height === "number" ? settings.height : typeof settings.customHeight === "number" ? settings.customHeight : void 0;
+  if (typeof settings.outputDevice === "string" || width !== void 0 || height !== void 0) {
     setOutputSize(dump, {
       device: typeof settings.outputDevice === "string" ? settings.outputDevice : void 0,
-      width: typeof settings.width === "number" ? settings.width : void 0,
-      height: typeof settings.height === "number" ? settings.height : void 0
+      width,
+      height
     });
   }
   applyLayerSettings(project.defaults, settings, lang);
@@ -21227,18 +21411,11 @@ function updateGlobalSettings(dump, settings, applyTo = "all") {
       if (Array.isArray(settings.popouts)) shot.popouts = clone(settings.popouts);
     }
   }
-  for (const [key, value] of Object.entries(settings)) {
-    if (RESERVED_GLOBAL.has(key) || key === "language" || key === "width" || key === "height" || key === "apply_to") continue;
-    if (key in project.defaults) {
-      project.defaults[key] = value;
-    } else if (key !== "gradientPreset") {
-      project[key] = value;
-    }
-  }
 }
 function updateScreenshotSettings(dump, index, settings) {
   const project = primaryProject(dump);
   const shot = screenshotAt(project, index);
+  assertKnownSettings(settings, "screenshot");
   const lang = typeof settings.language === "string" ? settings.language : project.currentLanguage || "en";
   if (typeof settings.language === "string") ensureLanguage(project, settings.language);
   applyLayerSettings(shot, settings, lang);
@@ -21246,35 +21423,6 @@ function updateScreenshotSettings(dump, index, settings) {
   if (Array.isArray(settings.popouts)) shot.popouts = settings.popouts;
   if (typeof settings.name === "string") shot.name = settings.name;
   if (typeof settings.deviceType === "string") shot.deviceType = settings.deviceType;
-  const known = /* @__PURE__ */ new Set([
-    "background",
-    "screenshot",
-    "text",
-    "elements",
-    "popouts",
-    "positionPreset",
-    "name",
-    "deviceType",
-    "language",
-    "src",
-    "localizedImages",
-    "image",
-    "font_family",
-    "fontFamily",
-    "font_weight",
-    "fontWeight",
-    "headline_font_family",
-    "subheadline_font_family",
-    "headline_weight",
-    "subheadline_weight",
-    "background_image_base64",
-    "background_image_url",
-    ...TEXT_SHORTCUTS
-  ]);
-  for (const [key, value] of Object.entries(renameColourKeys(settings))) {
-    if (known.has(key)) continue;
-    shot[key] = value;
-  }
   project.selectedIndex = index;
 }
 function setOutputSize(dump, input) {
@@ -21338,9 +21486,19 @@ function summarizeScreenshot(shot, index) {
     position: text.position
   };
 }
+function redactDataUrls(value) {
+  if (typeof value === "string") return value.startsWith("data:image/") ? "data-url" : value;
+  if (Array.isArray(value)) return value.map(redactDataUrls);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, child] of Object.entries(value)) out[key] = redactDataUrls(child);
+    return out;
+  }
+  return value;
+}
 function backupSummary(dump) {
   const project = primaryProject(dump);
-  return {
+  return redactDataUrls({
     id: project.id,
     name: projectName(dump),
     formatVersion: project.formatVersion,
@@ -21351,7 +21509,7 @@ function backupSummary(dump) {
     screenshotCount: project.screenshots.length,
     defaults: project.defaults,
     screenshots: project.screenshots.map((shot, index) => summarizeScreenshot(shot, index))
-  };
+  });
 }
 function bytesToBase64(bytes) {
   let binary = "";
@@ -21369,13 +21527,6 @@ function base64ToBytes(b64) {
   return out;
 }
 var MAX_IMAGE_BYTES = 15 * 1024 * 1024;
-function dataUrlFromBytes(mime, bytes) {
-  if (bytes.byteLength > MAX_IMAGE_BYTES) {
-    throw new ProjectError("image_too_large", `Image is ${bytes.byteLength} bytes; the limit is ${MAX_IMAGE_BYTES} (15 MiB).`);
-  }
-  const safeMime = /^image\/[a-zA-Z0-9.+-]+$/.test(mime) ? mime : "image/png";
-  return `data:${safeMime};base64,${bytesToBase64(bytes)}`;
-}
 function decodeImageBase64(input) {
   const trimmed = input.trim();
   const data = /^data:([^;,]+);base64,([\s\S]+)$/i.exec(trimmed);
@@ -21410,6 +21561,214 @@ function assertPublicImageUrl(raw) {
   if (url.protocol === "http:" && url.hostname !== "localhost") {
   }
   return url;
+}
+
+// src/assets.ts
+var MAX_PANORAMA_BYTES = 8 * 1024 * 1024;
+var ASSET_REF = /^asset:([a-f0-9]{64})$/;
+var ASSET_URL = /^(?:https?:\/\/[^/\s]+)?\/assets\/([a-f0-9]{64})$/i;
+function assertPanoramaBytes(bytes) {
+  if (bytes > MAX_PANORAMA_BYTES) {
+    throw new ProjectError(
+      "image_too_large",
+      `Panorama is ${bytes} bytes, above the 8 MiB limit. Export a smaller JPEG (lower quality or a shorter width) and retry set_panoramic_background.`
+    );
+  }
+}
+function assetKey(hash) {
+  return `asset:${hash}`;
+}
+function hex(bytes) {
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function storeAsset(kv, bytes, mime) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hash = hex(digest);
+  const key = assetKey(hash);
+  const existing = await kv.get(`${key}:meta`, { type: "text" });
+  if (typeof existing === "string" && existing) return `asset:${hash}`;
+  const safeMime = /^image\/[a-zA-Z0-9.+-]+$/.test(mime) ? mime : "application/octet-stream";
+  await putBytes(kv, key, bytes, safeMime);
+  return `asset:${hash}`;
+}
+function isBase64Char(code) {
+  return code >= 65 && code <= 90 || code >= 97 && code <= 122 || code >= 48 && code <= 57 || code === 43 || code === 47 || code === 61;
+}
+function isWhitespace(code) {
+  return code === 32 || code === 9 || code === 10 || code === 13;
+}
+function decodeBase64Range(text, start, end) {
+  let hasWhitespace = false;
+  for (let i = start; i < end; i++) {
+    if (isWhitespace(text.charCodeAt(i))) {
+      hasWhitespace = true;
+      break;
+    }
+  }
+  const source2 = hasWhitespace ? text.slice(start, end).replace(/\s+/g, "") : text;
+  const from2 = hasWhitespace ? 0 : start;
+  const to = hasWhitespace ? source2.length : end;
+  const len = to - from2;
+  if (len === 0 || len % 4 !== 0) {
+    throw new ProjectError("invalid_backup", "An embedded image had invalid base64.");
+  }
+  let pad = 0;
+  if (source2.charCodeAt(to - 1) === 61) pad++;
+  if (len >= 2 && source2.charCodeAt(to - 2) === 61) pad++;
+  const out = new Uint8Array(len / 4 * 3 - pad);
+  const stride = 4 * 256 * 1024;
+  let offset = 0;
+  for (let i = from2; i < to; i += stride) {
+    const sliceEnd = Math.min(to, i + stride);
+    const binary = atob(source2.slice(i, sliceEnd));
+    for (let j = 0; j < binary.length; j++) out[offset++] = binary.charCodeAt(j);
+  }
+  return offset === out.length ? out : out.subarray(0, offset);
+}
+async function replaceDataUrls(kv, text) {
+  const parts = [];
+  let cursor = 0;
+  let search = 0;
+  const marker = "data:image/";
+  while (search < text.length) {
+    const at = text.indexOf(marker, search);
+    if (at < 0) break;
+    const headerEnd = text.indexOf(";base64,", at);
+    if (headerEnd < 0 || headerEnd - at > 80) {
+      search = at + marker.length;
+      continue;
+    }
+    const mime = text.slice(at + "data:".length, headerEnd);
+    if (!/^image\/[a-zA-Z0-9.+-]+$/.test(mime)) {
+      search = at + marker.length;
+      continue;
+    }
+    let b64End = headerEnd + ";base64,".length;
+    while (b64End < text.length) {
+      const code = text.charCodeAt(b64End);
+      if (isBase64Char(code) || isWhitespace(code)) b64End++;
+      else break;
+    }
+    if (b64End === headerEnd + 8) {
+      search = at + marker.length;
+      continue;
+    }
+    const bytes = decodeBase64Range(text, headerEnd + 8, b64End);
+    const ref = await storeAsset(kv, bytes, mime);
+    parts.push(text.slice(cursor, at));
+    parts.push(ref);
+    cursor = b64End;
+    search = b64End;
+  }
+  parts.push(text.slice(cursor));
+  return parts.join("");
+}
+async function externalizeString(kv, value, panorama) {
+  if (!value.startsWith("data:image/")) return value;
+  const headerEnd = value.indexOf(";base64,");
+  if (headerEnd < 0) return value;
+  const mime = value.slice("data:".length, headerEnd);
+  const bytes = decodeBase64Range(value, headerEnd + 8, value.length);
+  if (panorama) assertPanoramaBytes(bytes.byteLength);
+  return storeAsset(kv, bytes, mime);
+}
+async function externalizeValue(kv, value, path = "") {
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const child = value[i];
+      if (typeof child === "string") {
+        const next = await externalizeString(kv, child, false);
+        if (next !== child) value[i] = next;
+      } else {
+        await externalizeValue(kv, child, `${path}[]`);
+      }
+    }
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const record = value;
+  for (const key of Object.keys(record)) {
+    const child = record[key];
+    const childPath = path ? `${path}.${key}` : key;
+    if (typeof child === "string") {
+      const panorama = key === "src" && (path === "panoramicBackground" || path.endsWith(".panoramicBackground") || path === "panoramic" || path.endsWith(".panoramic"));
+      const next = await externalizeString(kv, child, panorama);
+      if (next !== child) record[key] = next;
+    } else {
+      await externalizeValue(kv, child, childPath);
+    }
+  }
+}
+function presentAssetRefs(value, origin) {
+  if (typeof value === "string") {
+    const match = ASSET_REF.exec(value);
+    if (match) return `${origin}/assets/${match[1]}`;
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item) => presentAssetRefs(item, origin));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, child] of Object.entries(value)) out[key] = presentAssetRefs(child, origin);
+    return out;
+  }
+  return value;
+}
+function foldAssetUrls(value) {
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const child = value[i];
+      if (typeof child === "string") {
+        const folded = foldAssetString(child);
+        if (folded !== child) value[i] = folded;
+      } else {
+        foldAssetUrls(child);
+      }
+    }
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const record = value;
+  for (const key of Object.keys(record)) {
+    const child = record[key];
+    if (typeof child === "string") {
+      const folded = foldAssetString(child);
+      if (folded !== child) record[key] = folded;
+    } else {
+      foldAssetUrls(child);
+    }
+  }
+}
+function foldAssetString(value) {
+  const match = ASSET_URL.exec(value);
+  if (!match) return value;
+  return `asset:${match[1].toLowerCase()}`;
+}
+async function inlineAssetRefs(kv, value, cache = /* @__PURE__ */ new Map()) {
+  if (typeof value === "string") {
+    const match = ASSET_REF.exec(value);
+    if (!match) return value;
+    const hash = match[1];
+    const cached = cache.get(hash);
+    if (cached) return cached;
+    const blob = await getBytes(kv, assetKey(hash));
+    if (!blob) {
+      throw new ProjectError("missing_asset", `Image asset ${hash} is missing.`);
+    }
+    const dataUrl = `data:${blob.contentType};base64,${bytesToBase64(blob.bytes)}`;
+    cache.set(hash, dataUrl);
+    return dataUrl;
+  }
+  if (Array.isArray(value)) {
+    const out = [];
+    for (const item of value) out.push(await inlineAssetRefs(kv, item, cache));
+    return out;
+  }
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, child] of Object.entries(value)) out[key] = await inlineAssetRefs(kv, child, cache);
+    return out;
+  }
+  return value;
 }
 
 // src/schema.ts
@@ -21522,7 +21881,7 @@ function describeOptions() {
     fontWeights: ["300", "400", "500", "600", "700", "800", "900"],
     systemFonts: SYSTEM_FONTS,
     popularGoogleFonts: POPULAR_GOOGLE_FONTS,
-    fontsNote: "font_family plus font_weight (or headlineFont / subheadlineFont) accept any Google Fonts family, including Rubik, or a CSS font-family stack. The hosted app loads the face with FontFace and waits for document.fonts.ready before render-ready.",
+    fontsNote: "font_family plus font_weight (or headlineFont / subheadlineFont) accept any Google Fonts family, including Rubik, or a CSS font-family stack. Pass them under settings.text or at the top level of settings. The hosted app loads the face with FontFace and waits for document.fonts.ready before render-ready. Unknown setting keys are rejected.",
     textSpacing: {
       textGap: "number. Gap between headline and subheadline.",
       textGapUnit: ["px", "percent"],
@@ -21532,17 +21891,23 @@ function describeOptions() {
     backgroundImage: ["imageSrc", "imageFit", "imageOffsetX", "imageOffsetY", "imageScale", "imageBlur", "overlayColor", "overlayOpacity"],
     panoramicBackground: {
       enabled: "boolean",
-      src: "data URL of one wide image sliced across screenshots in order",
+      src: "One wide image sliced across screenshots in order. Stored as an asset ref; export/import still uses a data URL. New uploads are capped at 8 MiB.",
       overlap: "0 to 0.8, fraction of each slice shared with the next",
       scale: "percent",
       offsetY: "percent of image height"
     },
     deviceFraming: {
-      scale: "percent. The editor allows at least 30\u2013200. Values above 100 zoom past the canvas.",
+      scale: "percent. The editor allows at least 30\u2013200. Values above 100 zoom past the canvas. At scale 100 the 3D phone is about 108% of the canvas height.",
       x: "percent. Below 0 or above 100 moves the device off the sides. Not clamped to the canvas.",
       y: "percent. Below 0 or above 100 moves the device off the top or bottom.",
       rotation: "2D degrees",
       rotation3D: "{ x, y, z } degrees"
+    },
+    headlineSize: "Pixels. text.languageSettings.<lang>.headlineSize is what the canvas draws when perLanguageLayout is true, and it overrides the global text.headlineSize. A plain headlineSize setting writes the global size and that language entry (every language entry when per-language layout is off) so the language value does not silently win.",
+    textWrap: {
+      headlineTextWrap: ["wrap", "balance"],
+      subheadlineTextWrap: ["wrap", "balance"],
+      note: "balance keeps the same line count as wrap and narrows the measure so the lines are closer in length."
     },
     devices3D: ["iphone", "samsung"],
     frameColor3D: FRAME_COLORS_3D,
@@ -21582,8 +21947,8 @@ function backupSchema() {
               deviceType: "iPhone | iPad",
               localizedImages: { en: { src: "data-url", name: "string" } },
               background: "see describe_options",
-              screenshot: "2D/3D placement, shadow, frame",
-              text: "headlines, subheadlines, fonts, weights, sizes, colours, position",
+              screenshot: "2D/3D placement, shadow, frame. At scale 100 the 3D phone is about 108% of the canvas height.",
+              text: "headlines, subheadlines, fonts, weights, sizes, colours, position, headlineTextWrap, subheadlineTextWrap. text.languageSettings.<lang>.headlineSize overrides the global headlineSize when perLanguageLayout is true. A plain headlineSize write updates both.",
               elements: [],
               popouts: [],
               overrides: {}
@@ -21606,6 +21971,107 @@ function backupSchema() {
   };
 }
 
+// src/gate.ts
+var ProjectGate = class {
+  #chain = Promise.resolve();
+  #state;
+  constructor(state) {
+    this.#state = state;
+  }
+  async fetch(request) {
+    const previous = this.#chain;
+    let release = () => {
+    };
+    this.#chain = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await this.#handle(request);
+    } finally {
+      release();
+    }
+  }
+  async #handle(request) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ error: "invalid_gate_body" }, { status: 400 });
+    }
+    const storage = this.#state.storage;
+    if (body.op === "read") {
+      const version = Number(await storage.get("version") || 0);
+      const doc = await storage.get("doc");
+      return Response.json({ version, doc: typeof doc === "string" ? doc : null });
+    }
+    const run = async (txn) => {
+      if (body.op === "delete") {
+        await txn.delete("doc");
+        await txn.put("version", 0);
+        return Response.json({ ok: true, version: 0, doc: null });
+      }
+      if (body.op === "replace") {
+        const version = Number(await txn.get("version") || 0) + 1;
+        await txn.put("doc", body.doc || "");
+        await txn.put("version", version);
+        return Response.json({ ok: true, version, doc: body.doc || "" });
+      }
+      if (body.op === "cas") {
+        const version = Number(await txn.get("version") || 0);
+        const doc = await txn.get("doc");
+        const current = typeof doc === "string" ? doc : null;
+        if (version !== body.expected) {
+          return Response.json({ ok: false, version, doc: current });
+        }
+        const next = version + 1;
+        await txn.put("doc", body.doc || "");
+        await txn.put("version", next);
+        return Response.json({ ok: true, version: next, doc: body.doc || "" });
+      }
+      return Response.json({ error: "unknown_op" }, { status: 400 });
+    };
+    if (typeof storage.transaction === "function") return storage.transaction(run);
+    return run(storage);
+  }
+};
+var MemoryStorage = class {
+  #map = /* @__PURE__ */ new Map();
+  async get(key) {
+    return this.#map.has(key) ? this.#map.get(key) : void 0;
+  }
+  async put(key, value) {
+    this.#map.set(key, value);
+  }
+  async delete(key) {
+    this.#map.delete(key);
+  }
+  async transaction(closure) {
+    return closure(this);
+  }
+};
+var namespaces = /* @__PURE__ */ new WeakMap();
+function memoryProjectGate(kv) {
+  let gates = namespaces.get(kv);
+  if (!gates) {
+    gates = /* @__PURE__ */ new Map();
+    namespaces.set(kv, gates);
+  }
+  return {
+    idFromName(name) {
+      return name;
+    },
+    get(id) {
+      let gate = gates.get(id);
+      if (!gate) {
+        gate = new ProjectGate({ storage: new MemoryStorage() });
+        gates.set(id, gate);
+      }
+      return gate;
+    }
+  };
+}
+
 // src/store.ts
 var INDEX_KEY = "idx:projects";
 function projectKey(id) {
@@ -21613,6 +22079,25 @@ function projectKey(id) {
 }
 function fileKey(token) {
   return `file:${token}`;
+}
+function docKey(id) {
+  return `proj:${id}:doc`;
+}
+function legacyKey(id) {
+  return `proj:${id}:backup`;
+}
+function gateNamespace(env) {
+  if (env.PROJECT_GATE) return env.PROJECT_GATE;
+  return memoryProjectGate(env.APPSCREEN_KV);
+}
+async function gateCall(env, id, body) {
+  const ns = gateNamespace(env);
+  const stub = ns.get(ns.idFromName(id));
+  const response = await stub.fetch(new Request("https://project-gate.internal/", {
+    method: "POST",
+    body: JSON.stringify(body)
+  }));
+  return await response.json();
 }
 async function readIndex(kv) {
   const raw = await kv.get(INDEX_KEY, { type: "text" });
@@ -21631,45 +22116,117 @@ async function getEnvelope(kv, id) {
   if (typeof raw !== "string" || !raw) return null;
   return JSON.parse(raw);
 }
-async function getBackup(kv, id) {
-  const text = await getText(kv, `${projectKey(id)}:backup`);
-  if (!text) return null;
-  return assertBackup(JSON.parse(text));
-}
-async function saveProject(kv, envelope, backup) {
-  const project = primaryProject(backup);
+async function writeEnvelope(kv, envelope, backup, version, updatedAt) {
+  const current = await getEnvelope(kv, envelope.id);
+  if (current && (current.docVersion || 0) > version) return;
+  envelope.docVersion = version;
   envelope.name = projectName(backup, envelope.id) || envelope.name;
-  envelope.screenshotCount = project.screenshots.length;
-  envelope.updatedAt = envelope.updatedAt || (/* @__PURE__ */ new Date()).toISOString();
-  const body = JSON.stringify(backup);
-  await putText(kv, `${projectKey(envelope.id)}:backup`, body);
+  envelope.screenshotCount = primaryProject(backup).screenshots.length;
+  if (updatedAt) envelope.updatedAt = updatedAt;
   await kv.put(`${projectKey(envelope.id)}:envelope`, JSON.stringify(envelope));
   const index = await readIndex(kv);
+  const existing = index.find((item) => item.id === envelope.id);
+  if (existing && (existing.docVersion || 0) > version) return;
   const entry = {
     id: envelope.id,
     name: envelope.name,
     createdAt: envelope.createdAt,
     updatedAt: envelope.updatedAt,
-    screenshotCount: envelope.screenshotCount
+    screenshotCount: envelope.screenshotCount,
+    docVersion: version
   };
-  const existing = index.findIndex((item) => item.id === envelope.id);
-  if (existing === -1) index.push(entry);
-  else index[existing] = entry;
+  if (!existing) index.push(entry);
+  else {
+    const at = index.findIndex((item) => item.id === envelope.id);
+    index[at] = entry;
+  }
   await writeIndex(kv, index);
 }
-async function deleteProjectRecord(kv, id) {
+function parseDoc(doc) {
+  return assertBackup(JSON.parse(doc));
+}
+async function readProjectDoc(env, id) {
+  const kv = env.APPSCREEN_KV;
+  const gate = await gateCall(env, id, { op: "read" });
+  if (gate.doc) return { version: gate.version, backup: parseDoc(gate.doc) };
+  const mirror = await kv.get(docKey(id), { type: "text" });
+  if (typeof mirror === "string" && mirror) {
+    const cas2 = await gateCall(env, id, { op: "cas", expected: gate.version, doc: mirror });
+    if (cas2.ok) return { version: cas2.version, backup: parseDoc(mirror) };
+    if (cas2.doc) return { version: cas2.version, backup: parseDoc(cas2.doc) };
+  }
+  let legacy = await getText(kv, legacyKey(id));
+  if (!legacy) return null;
+  let text = legacy;
+  legacy = "";
+  if (text.includes("data:image/")) text = await replaceDataUrls(kv, text);
+  const backup = parseDoc(text);
+  const doc = JSON.stringify(backup);
+  text = "";
+  const cas = await gateCall(env, id, { op: "cas", expected: gate.version, doc });
+  if (cas.ok) {
+    await kv.put(docKey(id), doc);
+    await deleteBlob(kv, legacyKey(id));
+    return { version: cas.version, backup };
+  }
+  if (cas.doc) return { version: cas.version, backup: parseDoc(cas.doc) };
+  return { version: cas.version, backup };
+}
+async function createProjectDoc(env, id, backup) {
+  const doc = JSON.stringify(backup);
+  const current = await gateCall(env, id, { op: "read" });
+  if (current.doc) throw new ProjectError("conflict", `Project ${id} already exists.`);
+  const cas = await gateCall(env, id, { op: "cas", expected: current.version, doc });
+  if (!cas.ok) throw new ProjectError("conflict", `Project ${id} already exists.`);
+  await env.APPSCREEN_KV.put(docKey(id), doc);
+  return cas.version;
+}
+async function installProject(env, envelope, backup) {
+  const version = await createProjectDoc(env, envelope.id, backup);
+  await writeEnvelope(env.APPSCREEN_KV, envelope, backup, version, envelope.updatedAt);
+}
+async function replaceProjectDoc(env, id, backup, updatedAt) {
+  await externalizeValue(env.APPSCREEN_KV, backup);
+  const doc = JSON.stringify(backup);
+  const replaced = await gateCall(env, id, { op: "replace", doc });
+  await env.APPSCREEN_KV.put(docKey(id), doc);
+  const envelope = await getEnvelope(env.APPSCREEN_KV, id);
+  if (envelope) await writeEnvelope(env.APPSCREEN_KV, envelope, backup, replaced.version, updatedAt);
+}
+async function modifyProject(env, id, mutate, updatedAt) {
+  const envelope = await getEnvelope(env.APPSCREEN_KV, id);
+  if (!envelope) throw new ProjectError("not_found", `Project ${id} was not found.`);
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const current = await readProjectDoc(env, id);
+    if (!current) throw new ProjectError("not_found", `Project ${id} was not found.`);
+    const draft = clone(current.backup);
+    await mutate(draft);
+    await externalizeValue(env.APPSCREEN_KV, draft);
+    const doc = JSON.stringify(draft);
+    const cas = await gateCall(env, id, { op: "cas", expected: current.version, doc });
+    if (!cas.ok) continue;
+    await env.APPSCREEN_KV.put(docKey(id), doc);
+    await writeEnvelope(env.APPSCREEN_KV, envelope, draft, cas.version, updatedAt);
+    return draft;
+  }
+  throw new ProjectError(
+    "conflict",
+    "Could not save the project after concurrent edits. Retry the tool."
+  );
+}
+async function deleteProjectRecord(env, id) {
+  const kv = env.APPSCREEN_KV;
   const envelope = await getEnvelope(kv, id);
   if (!envelope) return false;
-  await deleteBlob(kv, `${projectKey(id)}:backup`);
+  await gateCall(env, id, { op: "delete" });
+  await kv.delete(docKey(id));
+  await deleteBlob(kv, legacyKey(id));
   await kv.delete(`${projectKey(id)}:envelope`);
   for (const token of envelope.fileTokens || []) {
     await deleteBlob(kv, fileKey(token));
   }
   const index = await readIndex(kv);
-  await writeIndex(
-    kv,
-    index.filter((item) => item.id !== id)
-  );
+  await writeIndex(kv, index.filter((item) => item.id !== id));
   return true;
 }
 async function rememberFile(kv, id, token) {
@@ -21778,7 +22335,7 @@ var imageProps = {
 };
 var settingsSchema = {
   type: "object",
-  description: "Partial backup settings. background (gradient, solid, imageSrc, imageOffsetX/Y, imageScale), screenshot (positionPreset, use3D, device3D, scale up to 200, x/y that may leave the canvas, rotation3D {x,y,z}, shadow, frame), and text (font_family, font_weight, textGap, textGapUnit, headlineLetterSpacing, subheadlineLetterSpacing) deep-merge. colour is accepted as an alias of color.",
+  description: "Partial backup settings. background, screenshot, and text deep-merge. Text aliases (font_family, font_weight, headline, subheadline, textGap, letter spacing, headlineSize, headlineTextWrap, subheadlineTextWrap) apply under settings.text and at the top level. headlineSize also writes text.languageSettings for the active language, because that entry overrides the global size when per-language layout is on. headlineTextWrap and subheadlineTextWrap are wrap or balance. At scale 100 the 3D phone is about 108% of the canvas height. Unknown keys are an error. colour is an alias of color.",
   additionalProperties: true
 };
 var TOOLS = [
@@ -21800,7 +22357,7 @@ var TOOLS = [
   },
   {
     name: "get_project",
-    description: "Fetch a project summary and its live edit URL. Set include_backup to return the full Export/Import backup JSON (large when screenshots are embedded).",
+    description: "Fetch a project summary and its live edit URL. Set include_backup to return the self-contained Export/Import backup JSON with image data URLs. The stored project document keeps images as asset refs, so a settings edit does not rewrite them.",
     inputSchema: {
       type: "object",
       properties: {
@@ -21891,7 +22448,7 @@ var TOOLS = [
   },
   {
     name: "update_screenshot_settings",
-    description: "Update one screenshot: background (gradient, solid, image), 2D/3D device and position preset, scale, rotation, shadow, frame, headline and subheadline text, font, weight, size, colour, and position. Other backup fields are deep-merged.",
+    description: "Update one screenshot: background (gradient, solid, image), 2D/3D device and position preset, scale, rotation, shadow, frame, and text. settings.text and settings.screenshot objects apply, and the same text aliases work at the top level. This writes only the small project JSON. Unknown keys are an error. At scale 100 the 3D phone is about 108% of the canvas height. headlineSize writes text.languageSettings.<lang>.headlineSize as well as the global size.",
     inputSchema: {
       type: "object",
       properties: {
@@ -21905,7 +22462,7 @@ var TOOLS = [
   },
   {
     name: "set_panoramic_background",
-    description: "Use one wide image as a background sliced across screenshots in order. overlap is 0\u20130.8 (share of each slice). scale is percent. offset_y shifts the crop vertically, as a percent of image height. Omit the image to change overlap, scale, or offset only.",
+    description: "Use one wide image as a background sliced across screenshots in order. overlap is 0\u20130.8 (share of each slice). scale is percent. offset_y shifts the crop vertically, as a percent of image height. Omit the image to change overlap, scale, or offset only. A new panorama must be 8 MiB or smaller.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22008,13 +22565,18 @@ async function requireProject(services, projectId) {
     throw new ProjectError("invalid_request", "project_id is required.");
   }
   const envelope = await getEnvelope(services.env.APPSCREEN_KV, projectId);
-  const backup = await getBackup(services.env.APPSCREEN_KV, projectId);
-  if (!envelope || !backup) throw new ProjectError("not_found", `Project ${projectId} was not found.`);
-  return { envelope, backup };
+  const loaded = envelope ? await readProjectDoc(services.env, projectId) : null;
+  if (!envelope || !loaded) throw new ProjectError("not_found", `Project ${projectId} was not found.`);
+  return { envelope, backup: loaded.backup };
 }
-async function persist(services, envelope, backup) {
-  envelope.updatedAt = nowIso(services);
-  await saveProject(services.env.APPSCREEN_KV, envelope, backup);
+async function editProject(services, projectId, mutate) {
+  if (!projectId || typeof projectId !== "string") {
+    throw new ProjectError("invalid_request", "project_id is required.");
+  }
+  const backup = await modifyProject(services.env, projectId, mutate, nowIso(services));
+  const envelope = await getEnvelope(services.env.APPSCREEN_KV, projectId);
+  if (!envelope) throw new ProjectError("not_found", `Project ${projectId} was not found.`);
+  return { envelope, backup };
 }
 function resolveGradients(settings) {
   const apply = (node) => {
@@ -22039,26 +22601,27 @@ async function applyBackgroundImageArgs(services, settings) {
   const b64 = typeof settings.background_image_base64 === "string" ? settings.background_image_base64 : typeof bg.image_base64 === "string" ? bg.image_base64 : "";
   const url = typeof settings.background_image_url === "string" ? settings.background_image_url : typeof bg.image_url === "string" ? bg.image_url : "";
   if (!b64.trim() && !url.trim()) return;
-  const image = await loadImageData(services, { image_base64: b64, image_url: url });
-  settings.background = { ...bg, type: "image", imageSrc: image.dataUrl, image: null };
+  const image = await loadImageBytes(services, { image_base64: b64, image_url: url });
+  const ref = await storeAsset(services.env.APPSCREEN_KV, image.bytes, image.mime);
+  settings.background = { ...bg, type: "image", imageSrc: ref, image: null };
   delete settings.background.image_base64;
   delete settings.background.image_url;
   delete settings.background_image_base64;
   delete settings.background_image_url;
 }
-async function loadImageData(services, args) {
+async function loadImageBytes(services, args) {
   const named = typeof args.name === "string" ? args.name : void 0;
   const language = typeof args.language === "string" ? args.language : void 0;
   const deviceType = typeof args.device_type === "string" ? args.device_type : void 0;
   if (typeof args.image_base64 === "string" && args.image_base64.trim()) {
     const decoded = decodeImageBase64(args.image_base64);
-    return { dataUrl: dataUrlFromBytes(decoded.mime, decoded.bytes), name: named, language, deviceType };
+    return { mime: decoded.mime, bytes: decoded.bytes, name: named, language, deviceType };
   }
   if (typeof args.image_url === "string" && args.image_url.trim()) {
     assertPublicImageUrl(args.image_url);
     const loader = services.loadImage || defaultLoadImage;
     const loaded = await loader(args.image_url);
-    return { dataUrl: dataUrlFromBytes(loaded.mime, loaded.bytes), name: named, language, deviceType };
+    return { mime: loaded.mime, bytes: loaded.bytes, name: named, language, deviceType };
   }
   throw new ProjectError("invalid_image", "Provide image_url or image_base64.");
 }
@@ -22121,7 +22684,7 @@ async function callTool(services, name, args) {
         screenshotCount: 0,
         fileTokens: []
       };
-      await saveProject(services.env.APPSCREEN_KV, envelope, backup);
+      await installProject(services.env, envelope, backup);
       return {
         data: {
           project_id: id,
@@ -22146,44 +22709,50 @@ async function callTool(services, name, args) {
         output: outputSizeOf(project),
         summary: backupSummary(backup)
       };
-      if (args.include_backup === true) data.backup = backup;
+      if (args.include_backup === true) data.backup = await inlineAssetRefs(services.env.APPSCREEN_KV, clone(backup));
       return { data };
     }
     case "delete_project": {
       const id = String(args.project_id || "");
-      const removed = await deleteProjectRecord(services.env.APPSCREEN_KV, id);
+      const removed = await deleteProjectRecord(services.env, id);
       if (!removed) throw new ProjectError("not_found", `Project ${id} was not found.`);
       return { data: { deleted: true, project_id: id } };
     }
     case "add_screenshot": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
-      const image = await loadImageData(services, args);
-      const index = addScreenshot(backup, image, Number.isInteger(args.index) ? Number(args.index) : void 0);
-      await persist(services, envelope, backup);
+      const image = await loadImageBytes(services, args);
+      const ref = await storeAsset(services.env.APPSCREEN_KV, image.bytes, image.mime);
+      const indexArg = Number.isInteger(args.index) ? Number(args.index) : void 0;
+      let index = 0;
+      const { envelope, backup } = await editProject(services, String(args.project_id || ""), (draft) => {
+        index = addScreenshot(draft, { ...image, dataUrl: ref }, indexArg);
+      });
       return { data: { project_id: envelope.id, index, screenshot_count: primaryProject(backup).screenshots.length } };
     }
     case "replace_screenshot": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
-      const image = await loadImageData(services, args);
-      replaceScreenshot(backup, Number(args.index), image);
-      await persist(services, envelope, backup);
-      return { data: { project_id: envelope.id, index: Number(args.index) } };
+      const image = await loadImageBytes(services, args);
+      const ref = await storeAsset(services.env.APPSCREEN_KV, image.bytes, image.mime);
+      const index = Number(args.index);
+      const { envelope } = await editProject(services, String(args.project_id || ""), (draft) => {
+        replaceScreenshot(draft, index, { ...image, dataUrl: ref });
+      });
+      return { data: { project_id: envelope.id, index } };
     }
     case "reorder_screenshots": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       if (!Array.isArray(args.order)) throw new ProjectError("invalid_order", "order must be an array of indexes.");
-      reorderScreenshots(backup, args.order.map((n) => Number(n)));
-      await persist(services, envelope, backup);
+      const order = args.order.map((n) => Number(n));
+      const { envelope } = await editProject(services, String(args.project_id || ""), (draft) => {
+        reorderScreenshots(draft, order);
+      });
       return { data: { project_id: envelope.id, order: args.order } };
     }
     case "remove_screenshot": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
-      removeScreenshot(backup, Number(args.index));
-      await persist(services, envelope, backup);
+      const index = Number(args.index);
+      const { envelope, backup } = await editProject(services, String(args.project_id || ""), (draft) => {
+        removeScreenshot(draft, index);
+      });
       return { data: { project_id: envelope.id, screenshot_count: primaryProject(backup).screenshots.length } };
     }
     case "update_global_settings": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       if (!args.settings || typeof args.settings !== "object" || Array.isArray(args.settings)) {
         throw new ProjectError("invalid_request", "settings object is required.");
       }
@@ -22191,38 +22760,42 @@ async function callTool(services, name, args) {
       resolveGradients(settings);
       await applyBackgroundImageArgs(services, settings);
       const applyTo = args.apply_to === "defaults" ? "defaults" : "all";
-      updateGlobalSettings(backup, settings, applyTo);
-      if (typeof settings.name === "string") setProjectName(backup, settings.name);
-      await persist(services, envelope, backup);
+      const { envelope, backup } = await editProject(services, String(args.project_id || ""), (draft) => {
+        updateGlobalSettings(draft, settings, applyTo);
+        if (typeof settings.name === "string") setProjectName(draft, settings.name);
+      });
       return { data: { project_id: envelope.id, summary: backupSummary(backup) } };
     }
     case "update_screenshot_settings": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       if (!args.settings || typeof args.settings !== "object" || Array.isArray(args.settings)) {
         throw new ProjectError("invalid_request", "settings object is required.");
       }
       const settings = { ...args.settings };
       resolveGradients(settings);
       await applyBackgroundImageArgs(services, settings);
-      updateScreenshotSettings(backup, Number(args.index), settings);
-      await persist(services, envelope, backup);
-      return { data: { project_id: envelope.id, index: Number(args.index), summary: backupSummary(backup) } };
+      const index = Number(args.index);
+      const { envelope, backup } = await editProject(services, String(args.project_id || ""), (draft) => {
+        updateScreenshotSettings(draft, index, settings);
+      });
+      return { data: { project_id: envelope.id, index, summary: backupSummary(backup) } };
     }
     case "set_panoramic_background": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       let src;
       if (typeof args.image_base64 === "string" && args.image_base64.trim() || typeof args.image_url === "string" && args.image_url.trim()) {
-        const image = await loadImageData(services, args);
-        src = image.dataUrl;
+        const image = await loadImageBytes(services, args);
+        assertPanoramaBytes(image.bytes.byteLength);
+        src = await storeAsset(services.env.APPSCREEN_KV, image.bytes, image.mime);
       }
-      const pano = setPanoramicBackground(backup, {
-        src,
-        enabled: typeof args.enabled === "boolean" ? args.enabled : void 0,
-        overlap: typeof args.overlap === "number" ? args.overlap : void 0,
-        scale: typeof args.scale === "number" ? args.scale : void 0,
-        offsetY: typeof args.offset_y === "number" ? args.offset_y : void 0
+      let pano = {};
+      const { envelope } = await editProject(services, String(args.project_id || ""), (draft) => {
+        pano = setPanoramicBackground(draft, {
+          src,
+          enabled: typeof args.enabled === "boolean" ? args.enabled : void 0,
+          overlap: typeof args.overlap === "number" ? args.overlap : void 0,
+          scale: typeof args.scale === "number" ? args.scale : void 0,
+          offsetY: typeof args.offset_y === "number" ? args.offset_y : void 0
+        });
       });
-      await persist(services, envelope, backup);
       return {
         data: {
           project_id: envelope.id,
@@ -22237,16 +22810,17 @@ async function callTool(services, name, args) {
       };
     }
     case "set_output_size": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       if (typeof args.device !== "string" && typeof args.width !== "number" && typeof args.height !== "number") {
         throw new ProjectError("invalid_size", "Provide device, or width and height for a custom size.");
       }
-      const size = setOutputSize(backup, {
-        device: typeof args.device === "string" ? args.device : void 0,
-        width: typeof args.width === "number" ? args.width : void 0,
-        height: typeof args.height === "number" ? args.height : void 0
+      let size = { device: "custom", width: 0, height: 0 };
+      const { envelope } = await editProject(services, String(args.project_id || ""), (draft) => {
+        size = setOutputSize(draft, {
+          device: typeof args.device === "string" ? args.device : void 0,
+          width: typeof args.width === "number" ? args.width : void 0,
+          height: typeof args.height === "number" ? args.height : void 0
+        });
       });
-      await persist(services, envelope, backup);
       return { data: { project_id: envelope.id, ...size } };
     }
     case "render_preview": {
@@ -22537,6 +23111,19 @@ async function routeInner(request, env, renderScreenshots2) {
       headers: { "content-type": encoded.contentType }
     });
   }
+  const assetMatch = url.pathname.match(/^\/assets\/([a-f0-9]{64})$/i);
+  if (assetMatch && request.method === "GET") {
+    const file = await getBytes(env.APPSCREEN_KV, `asset:${assetMatch[1].toLowerCase()}`);
+    if (!file) return json({ error: "not_found" }, 404);
+    return new Response(file.bytes, {
+      status: 200,
+      headers: {
+        "content-type": file.contentType,
+        "content-length": String(file.bytes.byteLength),
+        "cache-control": "public, max-age=31536000, immutable"
+      }
+    });
+  }
   const fileMatch = url.pathname.match(/^\/f\/([a-f0-9]{32,128})(?:\/([^/]+))?$/i);
   if (fileMatch && request.method === "GET") {
     const file = await getPublicFile(env.APPSCREEN_KV, fileMatch[1]);
@@ -22565,9 +23152,9 @@ async function getProject(request, env, id) {
   if (!canWriteProject(request, env, envelope.editKey)) {
     return json({ error: "unauthorized", message: "A valid edit key or MCP token is required." }, 401);
   }
-  const backup = await getBackup(env.APPSCREEN_KV, id);
-  if (!backup) return json({ error: "not_found" }, 404);
-  return json(backup);
+  const loaded = await readProjectDoc(env, id);
+  if (!loaded) return json({ error: "not_found" }, 404);
+  return json(presentAssetRefs(loaded.backup, publicOrigin(request, env)));
 }
 async function putProject(request, env, id) {
   const envelope = await getEnvelope(env.APPSCREEN_KV, id);
@@ -22590,11 +23177,16 @@ async function putProject(request, env, id) {
   }
   let parsed;
   try {
+    if (text.includes("data:image/")) text = await replaceDataUrls(env.APPSCREEN_KV, text);
     parsed = JSON.parse(text);
-  } catch {
+  } catch (error) {
+    if (error instanceof ProjectError) {
+      return json({ error: error.code, message: error.message }, 400);
+    }
     return json({ error: "invalid_backup", message: "Body is not JSON." }, 400);
   }
   try {
+    foldAssetUrls(parsed);
     const backup = assertBackup(parsed);
     const project = backup.projects.find((item) => item.id === id) || backup.projects[0];
     project.id = id;
@@ -22610,9 +23202,9 @@ async function putProject(request, env, id) {
         setProjectName(backup, listed.value[0].name || envelope.name);
       }
     }
-    envelope.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-    await saveProject(env.APPSCREEN_KV, envelope, backup);
-    return json({ ok: true, project_id: id, updated_at: envelope.updatedAt });
+    const updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+    await replaceProjectDoc(env, id, backup, updatedAt);
+    return json({ ok: true, project_id: id, updated_at: updatedAt });
   } catch (error) {
     if (error instanceof ProjectError || error instanceof KvLimitError) {
       const status = error instanceof KvLimitError ? 413 : 400;
@@ -22623,14 +23215,93 @@ async function putProject(request, env, id) {
 }
 
 // src/render.ts
-async function renderScreenshots(env, pageUrl, indices) {
-  if (!env.BROWSER) {
+var BROWSER_KEEP_ALIVE_MS = 18e4;
+var BROWSER_RETRY_DELAYS_MS = [2e3, 8e3];
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function isBrowserRateLimit(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b429\b/.test(message) || /rate limit/i.test(message);
+}
+function acquisitionWaitMs(value) {
+  if (value == null || !Number.isFinite(value) || value <= 0) return null;
+  if (value < 1e3) return Math.round(value * 1e3);
+  return Math.round(value);
+}
+function browserRateLimitError(cause, limits2) {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  const waitMs = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
+  const seconds = waitMs != null ? Math.max(1, Math.ceil(waitMs / 1e3)) : 60;
+  const daily = /daily|browser hours|duration quota/i.test(raw) ? " If the message is the free-plan daily browser-time cap, retry after that allowance resets." : "";
+  return new Error(
+    `Browser Rendering rate limit: ${raw}. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A free session is reused when one is still alive, and every screenshot in one call shares that browser.${daily}`
+  );
+}
+async function connectFreeSession(puppeteer2, endpoint) {
+  let sessions2 = [];
+  try {
+    sessions2 = await puppeteer2.sessions(endpoint);
+  } catch {
+    return null;
+  }
+  for (const session of sessions2) {
+    if (!session?.sessionId || session.connectionId) continue;
+    try {
+      return await puppeteer2.connect(endpoint, session.sessionId);
+    } catch {
+    }
+  }
+  return null;
+}
+async function readLimits(puppeteer2, endpoint) {
+  if (!puppeteer2.limits) return null;
+  try {
+    return await puppeteer2.limits(endpoint);
+  } catch {
+    return null;
+  }
+}
+function retryDelay(attempt, limits2) {
+  const indicated = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
+  if (indicated == null) return BROWSER_RETRY_DELAYS_MS[attempt] ?? 8e3;
+  return Math.min(Math.max(indicated, 250), 15e3);
+}
+async function acquireBrowser(puppeteer2, endpoint, wait = sleep) {
+  const existing = await connectFreeSession(puppeteer2, endpoint);
+  if (existing) return existing;
+  let lastError;
+  let lastLimits = null;
+  const attempts = BROWSER_RETRY_DELAYS_MS.length + 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await puppeteer2.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
+    } catch (error) {
+      lastError = error;
+      if (!isBrowserRateLimit(error)) throw error;
+      lastLimits = await readLimits(puppeteer2, endpoint);
+      if (attempt === attempts - 1) throw browserRateLimitError(error, lastLimits);
+      await wait(retryDelay(attempt, lastLimits));
+      const freed = await connectFreeSession(puppeteer2, endpoint);
+      if (freed) return freed;
+    }
+  }
+  throw browserRateLimitError(lastError, lastLimits);
+}
+async function releaseBrowser(browser) {
+  if (typeof browser.disconnect === "function") {
+    await browser.disconnect();
+    return;
+  }
+  if (typeof browser.close === "function") await browser.close();
+}
+async function renderScreenshots(env, pageUrl, indices, hooks) {
+  if (!env.BROWSER && !hooks?.puppeteer) {
     throw new Error("Browser Rendering binding BROWSER is not configured.");
   }
-  const puppeteer2 = (await Promise.resolve().then(() => (init_puppeteer_cloudflare(), puppeteer_cloudflare_exports))).default;
-  const browser = await puppeteer2.launch(env.BROWSER);
+  const puppeteer2 = hooks?.puppeteer ?? (await Promise.resolve().then(() => (init_puppeteer_cloudflare(), puppeteer_cloudflare_exports))).default;
+  const browser = await acquireBrowser(puppeteer2, env.BROWSER, hooks?.sleep);
+  let page;
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
     await page.setViewport({ width: 900, height: 900, deviceScaleFactor: 1 });
     await page.goto(pageUrl, { waitUntil: "networkidle0", timeout: 9e4 });
     await page.waitForFunction(
@@ -22663,7 +23334,13 @@ async function renderScreenshots(env, pageUrl, indices) {
       return { index: shot.index, png, width: shot.width, height: shot.height };
     });
   } finally {
-    await browser.close();
+    if (page?.close) {
+      try {
+        await page.close();
+      } catch {
+      }
+    }
+    await releaseBrowser(browser);
   }
 }
 
@@ -22674,5 +23351,6 @@ var index_default = {
   }
 };
 export {
+  ProjectGate,
   index_default as default
 };

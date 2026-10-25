@@ -62,6 +62,16 @@ interface BlobMeta {
 function metaKey(key: string): string {
   return `${key}:meta`;
 }
+
+async function existingChunkCount(kv: KvLike, key: string): Promise<number> {
+  const raw = await kv.get(metaKey(key), { type: "text" });
+  if (typeof raw !== "string" || !raw) return 0;
+  try {
+    return Number((JSON.parse(raw) as BlobMeta).chunks) || 0;
+  } catch {
+    return 0;
+  }
+}
 function chunkKey(key: string, index: number): string {
   return `${key}:c:${index}`;
 }
@@ -81,11 +91,14 @@ export async function putText(
       throw new KvLimitError(`A text chunk of "${key}" still exceeds the 25 MiB KV value limit.`);
     }
   }
-  const meta: BlobMeta = { chunks: parts.length, size, encoding: "text" };
-  await kv.put(metaKey(key), JSON.stringify(meta));
+  const previous = await existingChunkCount(kv, key);
+  // Chunks land before the meta pointer so a reader never sees a count for chunks that are not written yet.
   for (let i = 0; i < parts.length; i++) {
     await kv.put(chunkKey(key, i), parts[i]);
   }
+  const meta: BlobMeta = { chunks: parts.length, size, encoding: "text" };
+  await kv.put(metaKey(key), JSON.stringify(meta));
+  for (let i = parts.length; i < previous; i++) await kv.delete(chunkKey(key, i));
 }
 
 export async function getText(kv: KvLike, key: string): Promise<string | null> {
@@ -116,6 +129,10 @@ export async function putBytes(
 ): Promise<void> {
   assertObjectSize(bytes.byteLength, `Binary value "${key}"`, maxBytes);
   const parts = chunkBytes(bytes, chunkSize);
+  const previous = await existingChunkCount(kv, key);
+  for (let i = 0; i < parts.length; i++) {
+    await kv.put(chunkKey(key, i), parts[i]);
+  }
   const meta: BlobMeta = {
     chunks: parts.length,
     size: bytes.byteLength,
@@ -123,9 +140,7 @@ export async function putBytes(
     contentType,
   };
   await kv.put(metaKey(key), JSON.stringify(meta));
-  for (let i = 0; i < parts.length; i++) {
-    await kv.put(chunkKey(key, i), parts[i]);
-  }
+  for (let i = parts.length; i < previous; i++) await kv.delete(chunkKey(key, i));
 }
 
 export async function getBytes(kv: KvLike, key: string): Promise<{ bytes: Uint8Array; contentType: string } | null> {

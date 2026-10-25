@@ -1,9 +1,9 @@
 import { canWriteProject, editKeyFromRequest, requireMcpToken } from "./auth.ts";
-import { KvLimitError } from "./kvblob.ts";
+import { foldAssetUrls, presentAssetRefs, replaceDataUrls } from "./assets.ts";
+import { getBytes, KvLimitError, MAX_OBJECT_BYTES } from "./kvblob.ts";
 import { handleMcpRpc, mcpHttpBody } from "./mcp.ts";
 import { assertBackup, ProjectError, setProjectName } from "./project.ts";
-import { getBackup, getEnvelope, getPublicFile, saveProject } from "./store.ts";
-import { MAX_OBJECT_BYTES } from "./kvblob.ts";
+import { getEnvelope, getPublicFile, readProjectDoc, replaceProjectDoc } from "./store.ts";
 import type { Env, Services } from "./types.ts";
 
 const PAGES_ORIGIN = "https://matinrahimik.github.io";
@@ -103,6 +103,20 @@ async function routeInner(
     });
   }
 
+  const assetMatch = url.pathname.match(/^\/assets\/([a-f0-9]{64})$/i);
+  if (assetMatch && request.method === "GET") {
+    const file = await getBytes(env.APPSCREEN_KV, `asset:${assetMatch[1].toLowerCase()}`);
+    if (!file) return json({ error: "not_found" }, 404);
+    return new Response(file.bytes, {
+      status: 200,
+      headers: {
+        "content-type": file.contentType,
+        "content-length": String(file.bytes.byteLength),
+        "cache-control": "public, max-age=31536000, immutable",
+      },
+    });
+  }
+
   const fileMatch = url.pathname.match(/^\/f\/([a-f0-9]{32,128})(?:\/([^/]+))?$/i);
   if (fileMatch && request.method === "GET") {
     const file = await getPublicFile(env.APPSCREEN_KV, fileMatch[1]);
@@ -134,9 +148,9 @@ async function getProject(request: Request, env: Env, id: string): Promise<Respo
   if (!canWriteProject(request, env, envelope.editKey)) {
     return json({ error: "unauthorized", message: "A valid edit key or MCP token is required." }, 401);
   }
-  const backup = await getBackup(env.APPSCREEN_KV, id);
-  if (!backup) return json({ error: "not_found" }, 404);
-  return json(backup);
+  const loaded = await readProjectDoc(env, id);
+  if (!loaded) return json({ error: "not_found" }, 404);
+  return json(presentAssetRefs(loaded.backup, publicOrigin(request, env)));
 }
 
 async function putProject(request: Request, env: Env, id: string): Promise<Response> {
@@ -160,11 +174,16 @@ async function putProject(request: Request, env: Env, id: string): Promise<Respo
   }
   let parsed: unknown;
   try {
+    if (text.includes("data:image/")) text = await replaceDataUrls(env.APPSCREEN_KV, text);
     parsed = JSON.parse(text);
-  } catch {
+  } catch (error) {
+    if (error instanceof ProjectError) {
+      return json({ error: error.code, message: error.message }, 400);
+    }
     return json({ error: "invalid_backup", message: "Body is not JSON." }, 400);
   }
   try {
+    foldAssetUrls(parsed);
     const backup = assertBackup(parsed);
     const project = backup.projects.find((item) => item.id === id) || backup.projects[0];
     project.id = id;
@@ -180,9 +199,9 @@ async function putProject(request: Request, env: Env, id: string): Promise<Respo
         setProjectName(backup, ((listed.value as { name?: string }[])[0].name) || envelope.name);
       }
     }
-    envelope.updatedAt = new Date().toISOString();
-    await saveProject(env.APPSCREEN_KV, envelope, backup);
-    return json({ ok: true, project_id: id, updated_at: envelope.updatedAt });
+    const updatedAt = new Date().toISOString();
+    await replaceProjectDoc(env, id, backup, updatedAt);
+    return json({ ok: true, project_id: id, updated_at: updatedAt });
   } catch (error) {
     if (error instanceof ProjectError || error instanceof KvLimitError) {
       const status = error instanceof KvLimitError ? 413 : 400;
