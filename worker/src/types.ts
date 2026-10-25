@@ -15,6 +15,11 @@ export interface Env {
   PAGES_PATH?: string;
   /** Public origin of this Worker. Falls back to the incoming request origin. */
   PUBLIC_BASE_URL?: string;
+  /** One Durable Object per project. Serializes compare-and-swap of the project JSON. */
+  PROJECT_GATE?: {
+    idFromName(name: string): unknown;
+    get(id: unknown): { fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> };
+  };
 }
 
 export interface RenderShot {

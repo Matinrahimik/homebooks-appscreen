@@ -21,6 +21,17 @@
       "type": "plain_text",
       "name": "PAGES_PATH",
       "text": "/homebooks-appscreen/"
+    },
+    {
+      "type": "durable_object_namespace",
+      "name": "PROJECT_GATE",
+      "class_name": "ProjectGate"
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1-project-gate",
+      "new_sqlite_classes": ["ProjectGate"]
     }
   ]
 }

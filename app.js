@@ -34,7 +34,7 @@ const state = {
         },
         screenshot: {
             scale: 70,
-            y: 60,
+            y: 100,
             x: 50,
             rotation: 0,
             perspective: 0,
@@ -87,6 +87,8 @@ const state = {
             textGapUnit: 'px',
             headlineLetterSpacing: 0,
             subheadlineLetterSpacing: 0,
+            headlineTextWrap: 'wrap',
+            subheadlineTextWrap: 'wrap',
             subheadlineEnabled: false,
             subheadlines: { en: '' },
             subheadlineLanguages: ['en'],
@@ -595,6 +597,12 @@ function setTextSetting(key, value) {
     }
 }
 
+function assignImageSrc(img, src) {
+    if (typeof src === 'string' && /^https?:\/\//i.test(src)) img.crossOrigin = 'anonymous';
+    img.src = src;
+    return img;
+}
+
 function attachBackgroundImage(bg) {
     if (!bg) return bg;
     if (!bg.imageSrc && typeof bg.image === 'string') bg.imageSrc = bg.image;
@@ -605,7 +613,7 @@ function attachBackgroundImage(bg) {
         img.onload = () => {
             if (typeof updateCanvas === 'function') updateCanvas();
         };
-        img.src = src;
+        assignImageSrc(img, src);
         bg.image = img;
     } else if (!src) {
         bg.image = bg.image instanceof HTMLImageElement ? bg.image : null;
@@ -632,7 +640,7 @@ function attachPanoramicImage(pano) {
         img.onload = () => {
             if (typeof updateCanvas === 'function') updateCanvas();
         };
-        img.src = next.src;
+        assignImageSrc(img, next.src);
         next.image = img;
     }
     return next;
@@ -661,6 +669,10 @@ function syncTextSpacingControls(text) {
     setSliderValue('subheadline-letter-spacing', text.subheadlineLetterSpacing || 0);
     const subTracking = document.getElementById('subheadline-letter-spacing-value');
     if (subTracking) subTracking.textContent = formatValue(text.subheadlineLetterSpacing || 0) + 'px';
+    const headlineBalance = document.getElementById('headline-wrap-balance');
+    if (headlineBalance) headlineBalance.classList.toggle('active', text.headlineTextWrap === 'balance');
+    const subBalance = document.getElementById('subheadline-wrap-balance');
+    if (subBalance) subBalance.classList.toggle('active', text.subheadlineTextWrap === 'balance');
 }
 
 function setSliderValue(id, value) {
@@ -1858,7 +1870,7 @@ function reconstructElementImages(elements) {
         const restored = { ...el };
         if (el.type === 'graphic' && el.src) {
             const img = new Image();
-            img.src = el.src;
+            assignImageSrc(img, el.src);
             restored.image = img;
         } else if (el.type === 'icon' && el.iconName) {
             // Async fetch; image will be null initially, then updateCanvas() when ready
@@ -1999,7 +2011,7 @@ function loadState() {
                                         };
                                         langImg.onload = finishLang;
                                         langImg.onerror = finishLang;
-                                        langImg.src = langData.src;
+                                        assignImageSrc(langImg, langData.src);
                                     } else {
                                         langLoadedCount++;
                                         if (langLoadedCount === langKeys.length) {
@@ -2043,7 +2055,7 @@ function loadState() {
                                     loadedCount++;
                                     checkAllLoaded();
                                 };
-                                img.src = s.src;
+                                assignImageSrc(img, s.src);
                             }
                         });
 
@@ -2162,11 +2174,14 @@ function resetStateToDefaults() {
         },
         screenshot: {
             scale: 70,
-            y: 60,
+            y: 100,
             x: 50,
             rotation: 0,
             perspective: 0,
             cornerRadius: 24,
+            use3D: false,
+            device3D: 'iphone',
+            rotation3D: { x: 0, y: 0, z: 0 },
             shadow: {
                 enabled: true,
                 color: '#000000',
@@ -2212,6 +2227,8 @@ function resetStateToDefaults() {
             textGapUnit: 'px',
             headlineLetterSpacing: 0,
             subheadlineLetterSpacing: 0,
+            headlineTextWrap: 'wrap',
+            subheadlineTextWrap: 'wrap',
             subheadlineEnabled: false,
             subheadlines: { en: '' },
             subheadlineLanguages: ['en'],
@@ -2366,7 +2383,7 @@ function duplicateScreenshot(index) {
             const langData = original.localizedImages[lang];
             if (langData?.src) {
                 const img = new Image();
-                img.src = langData.src;
+                assignImageSrc(img, langData.src);
                 clone.localizedImages[lang] = {
                     image: img,
                     src: langData.src,
@@ -2378,7 +2395,7 @@ function duplicateScreenshot(index) {
 
     if (original.image?.src) {
         const img = new Image();
-        img.src = original.image.src;
+        assignImageSrc(img, original.image.src);
         clone.image = img;
     }
 
@@ -4999,6 +5016,18 @@ function setupEventListeners() {
         document.getElementById('headline-letter-spacing-value').textContent = formatValue(e.target.value) + 'px';
         updateCanvas();
     });
+    document.getElementById('headline-wrap-balance').addEventListener('click', function () {
+        this.classList.toggle('active');
+        setTextSetting('headlineTextWrap', this.classList.contains('active') ? 'balance' : 'wrap');
+        updateCanvas();
+    });
+
+    document.getElementById('subheadline-wrap-balance').addEventListener('click', function () {
+        this.classList.toggle('active');
+        setTextSetting('subheadlineTextWrap', this.classList.contains('active') ? 'balance' : 'wrap');
+        updateCanvas();
+    });
+
     document.getElementById('subheadline-letter-spacing').addEventListener('input', (e) => {
         setTextSetting('subheadlineLetterSpacing', parseInt(e.target.value, 10));
         document.getElementById('subheadline-letter-spacing-value').textContent = formatValue(e.target.value) + 'px';
@@ -7719,7 +7748,7 @@ function drawTextToContext(context, dims, txt) {
         context.fillStyle = txt.headlineColor;
         applyLetterSpacing(context, txt.headlineLetterSpacing);
 
-        const lines = wrapText(context, headline, dims.width - padding * 2);
+        const lines = wrapTextLines(context, headline, dims.width - padding * 2, txt.headlineTextWrap);
         const lineHeight = headlineLayout.headlineSize * (layoutSettings.lineHeight / 100);
 
         // For bottom positioning, offset currentY so lines draw correctly
@@ -7777,7 +7806,7 @@ function drawTextToContext(context, dims, txt) {
         applyLetterSpacing(context, txt.subheadlineLetterSpacing);
         context.fillStyle = hexToRgba(txt.subheadlineColor, txt.subheadlineOpacity / 100);
 
-        const lines = wrapText(context, subheadline, dims.width - padding * 2);
+        const lines = wrapTextLines(context, subheadline, dims.width - padding * 2, txt.subheadlineTextWrap);
         const subLineHeight = subheadlineLayout.subheadlineSize * 1.4;
 
         // Subheadline starts after headline with gap determined by headline lineHeight
@@ -8387,7 +8416,7 @@ function drawText() {
         ctx.fillStyle = text.headlineColor;
         applyLetterSpacing(ctx, text.headlineLetterSpacing);
 
-        const lines = wrapText(ctx, headline, dims.width - padding * 2);
+        const lines = wrapTextLines(ctx, headline, dims.width - padding * 2, text.headlineTextWrap);
         const lineHeight = headlineLayout.headlineSize * (layoutSettings.lineHeight / 100);
 
         if (layoutSettings.position === 'bottom') {
@@ -8445,7 +8474,7 @@ function drawText() {
         applyLetterSpacing(ctx, text.subheadlineLetterSpacing);
         ctx.fillStyle = hexToRgba(text.subheadlineColor, text.subheadlineOpacity / 100);
 
-        const lines = wrapText(ctx, subheadline, dims.width - padding * 2);
+        const lines = wrapTextLines(ctx, subheadline, dims.width - padding * 2, text.subheadlineTextWrap);
         const subLineHeight = subheadlineLayout.subheadlineSize * 1.4;
 
         // Subheadline starts after headline with gap determined by headline lineHeight
@@ -8513,6 +8542,36 @@ function roundRect(ctx, x, y, width, height, radius) {
     ctx.lineTo(x, y + radius);
     ctx.quadraticCurveTo(x, y, x + radius, y);
     ctx.closePath();
+}
+
+function wrapTextLines(ctx, text, maxWidth, mode) {
+    if (mode === 'balance') return wrapBalancedText(ctx, text, maxWidth);
+    return wrapText(ctx, text, maxWidth);
+}
+
+function wrapBalancedText(ctx, text, maxWidth) {
+    const out = [];
+    String(text).split(/\r?\n/).forEach((rawLine) => {
+        if (rawLine === '') {
+            out.push('');
+            return;
+        }
+        const greedy = wrapText(ctx, rawLine, maxWidth);
+        if (greedy.length <= 1) {
+            out.push(...greedy);
+            return;
+        }
+        let lo = 0;
+        let hi = maxWidth;
+        for (let i = 0; i < 16; i++) {
+            const mid = (lo + hi) / 2;
+            const trial = wrapText(ctx, rawLine, mid);
+            if (trial.length <= greedy.length) hi = mid;
+            else lo = mid;
+        }
+        out.push(...wrapText(ctx, rawLine, hi));
+    });
+    return out;
 }
 
 function wrapText(ctx, text, maxWidth) {

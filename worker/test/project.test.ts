@@ -12,6 +12,7 @@ import {
   replaceScreenshot,
   setOutputSize,
   setPanoramicBackground,
+  defaultScreenshotSettings,
   updateGlobalSettings,
   updateScreenshotSettings,
   fontValue,
@@ -139,6 +140,114 @@ describe("backup mutations", () => {
     assert.equal(reloaded.projects[0].screenshots[0].screenshot.scale, 160);
   });
 
+  it("applies nested text settings and rejects unknown keys", () => {
+    const dump = createBackup("p1", "HomeBooks");
+    addScreenshot(dump, { dataUrl: PNG, name: "one.png" });
+    addScreenshot(dump, { dataUrl: PNG, name: "two.png" });
+    updateGlobalSettings(dump, {
+      text: {
+        font_family: "Rubik",
+        font_weight: 700,
+        headline: "Line one stays clear",
+        subheadline: "And the subheadline",
+        textGap: 18,
+        headlineLetterSpacing: 2,
+      },
+    });
+    const project = primaryProject(dump);
+    for (const text of [project.defaults.text, project.screenshots[0].text, project.screenshots[1].text]) {
+      assert.equal(text.headlineFont, "'Rubik', sans-serif");
+      assert.equal(text.subheadlineFont, "'Rubik', sans-serif");
+      assert.equal(text.headlineWeight, "700");
+      assert.equal(text.subheadlineWeight, "700");
+      assert.equal((text.headlines as { en: string }).en, "Line one stays clear");
+      assert.equal((text.subheadlines as { en: string }).en, "And the subheadline");
+      assert.equal(text.subheadlineEnabled, true);
+      assert.equal(text.font_family, undefined);
+      assert.equal(text.headline, undefined);
+      assert.equal(text.textGap, 18);
+      assert.equal(text.headlineLetterSpacing, 2);
+    }
+
+    updateScreenshotSettings(dump, 1, {
+      text: { font_family: "Fraunces", font_weight: "500", headline: "Only this shot" },
+    });
+    assert.equal(project.screenshots[1].text.headlineFont, "'Fraunces', sans-serif");
+    assert.equal((project.screenshots[1].text.headlines as { en: string }).en, "Only this shot");
+    assert.equal(project.screenshots[0].text.headlineFont, "'Rubik', sans-serif");
+    assert.equal(project.screenshots[1].text.font_family, undefined);
+
+    const before = JSON.stringify(dump);
+    assert.throws(
+      () => updateGlobalSettings(dump, { made_up: true }),
+      /Unknown setting "settings\.made_up"/,
+    );
+    assert.throws(
+      () => updateScreenshotSettings(dump, 0, { text: { font_family: "Rubik", nope: 1 } }),
+      /Unknown setting "settings\.text\.nope"/,
+    );
+    assert.throws(
+      () => updateScreenshotSettings(dump, 0, { screenshot: { scale: 80, wobble: 1 } }),
+      /Unknown setting "settings\.screenshot\.wobble"/,
+    );
+    assert.equal(JSON.stringify(dump), before);
+    assert.equal(project.screenshots[0].screenshot.scale, 70);
+
+    updateScreenshotSettings(dump, 0, { headlineSize: 80, subheadlineSize: 36 });
+    const laidOut = project.screenshots[0].text;
+    assert.equal(laidOut.headlineSize, 80);
+    assert.equal(laidOut.subheadlineSize, 36);
+    const enLayout = (laidOut.languageSettings as { en: { headlineSize: number; subheadlineSize: number } }).en;
+    assert.equal(enLayout.headlineSize, 80);
+    assert.equal(enLayout.subheadlineSize, 36);
+
+    laidOut.perLanguageLayout = true;
+    (laidOut.languageSettings as { de: { headlineSize: number } }).de = {
+      headlineSize: 90,
+      subheadlineSize: 40,
+      position: "top",
+      offsetY: 12,
+      lineHeight: 110,
+    } as { headlineSize: number };
+    updateScreenshotSettings(dump, 0, { headlineSize: 64 });
+    assert.equal(laidOut.headlineSize, 64);
+    assert.equal((laidOut.languageSettings as { en: { headlineSize: number } }).en.headlineSize, 64);
+    assert.equal((laidOut.languageSettings as { de: { headlineSize: number } }).de.headlineSize, 90);
+
+    updateScreenshotSettings(dump, 0, { headlineTextWrap: "balance", text: { subheadlineTextWrap: "balance" } });
+    const wrappedText = project.screenshots[0].text;
+    assert.equal(wrappedText.headlineTextWrap, "balance");
+    assert.equal(wrappedText.subheadlineTextWrap, "balance");
+    const wrapped = JSON.stringify(dump);
+    assert.throws(
+      () => updateScreenshotSettings(dump, 0, { headlineTextWrap: "banana" }),
+      /Invalid settings\.headlineTextWrap "banana"/,
+    );
+    assert.equal(JSON.stringify(dump), wrapped);
+  });
+
+  it("keeps the default device below a two-line headline and subheadline", () => {
+    const shot = defaultScreenshotSettings();
+    assert.equal(shot.scale, 70);
+    assert.equal(shot.y, 100);
+    const sizes = [
+      [1320, 2868],
+      [1290, 2796],
+      [1284, 2778],
+      [1242, 2208],
+      [2048, 2732],
+      [1668, 2388],
+    ];
+    for (const [width, height] of sizes) {
+      const top = deviceTop(width, height, width, height, Number(shot.scale), Number(shot.y));
+      const textEnd = twoLineTextBottom(height);
+      assert.ok(
+        top >= textEnd + 40,
+        `${width}x${height} device top ${top.toFixed(1)} overlaps text ending at ${textEnd.toFixed(1)}`,
+      );
+    }
+  });
+
   it("parses a UI gradient preset into stops", () => {
     const parsed = parseCssGradient("linear-gradient(135deg, #667eea 0%, #764ba2 100%)");
     assert.equal(parsed.angle, 135);
@@ -148,6 +257,27 @@ describe("backup mutations", () => {
     ]);
   });
 });
+
+/** Same placement as drawScreenshotToContext() in app.js. */
+function deviceTop(canvasW: number, canvasH: number, imageW: number, imageH: number, scalePercent: number, yPercent: number): number {
+  const scale = scalePercent / 100;
+  let imgWidth = canvasW * scale;
+  let imgHeight = (imageH / imageW) * imgWidth;
+  if (imgHeight > canvasH * scale) {
+    imgHeight = canvasH * scale;
+    imgWidth = (imageW / imageH) * imgHeight;
+  }
+  const moveY = Math.max(canvasH - imgHeight, canvasH * 0.15);
+  return (canvasH - imgHeight) / 2 + (yPercent / 100 - 0.5) * moveY;
+}
+
+/** Bottom of a two-line 100px headline plus the default 50px subheadline. */
+function twoLineTextBottom(canvasH: number): number {
+  const start = canvasH * 0.12;
+  const headlineSize = 100;
+  const lineHeight = headlineSize * 1.1;
+  return start + lineHeight + headlineSize + 10 + 50;
+}
 
 describe("kv limits", () => {
   it("rejects objects above the configured cap and round-trips chunks", async () => {

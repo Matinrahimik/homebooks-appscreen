@@ -135,7 +135,9 @@ export function defaultBackground(): Record<string, unknown> {
 export function defaultScreenshotSettings(): Record<string, unknown> {
   return {
     scale: 70,
-    y: 60,
+    // 100 keeps a scale-70 device below a two-line headline and the subheadline.
+    // At this scale the device top is (y / 100) * 30% of the canvas height.
+    y: 100,
     x: 50,
     rotation: 0,
     perspective: 0,
@@ -173,6 +175,8 @@ export function defaultText(): Record<string, unknown> {
     textGapUnit: "px",
     headlineLetterSpacing: 0,
     subheadlineLetterSpacing: 0,
+    headlineTextWrap: "wrap",
+    subheadlineTextWrap: "wrap",
     subheadlineEnabled: false,
     subheadlines: { en: "" },
     subheadlineLanguages: ["en"],
@@ -508,11 +512,37 @@ const TEXT_SHORTCUTS = [
   "textGapUnit",
   "headlineLetterSpacing",
   "subheadlineLetterSpacing",
+  "headlineTextWrap",
+  "subheadlineTextWrap",
   "perLanguageLayout",
   "languageSettings",
   "headlines",
   "subheadlines",
 ] as const;
+
+const LAYOUT_WRITE_KEYS = ["headlineSize", "subheadlineSize", "position", "offsetY", "lineHeight"] as const;
+
+/** A plain headlineSize (and the other layout fields) also updates languageSettings, which otherwise overrides the global size. */
+function applyEffectiveLayout(text: Record<string, unknown>, settings: Record<string, unknown>, lang: string): void {
+  const patch: Record<string, unknown> = {};
+  for (const key of LAYOUT_WRITE_KEYS) {
+    if (settings[key] !== undefined) patch[key] = settings[key];
+  }
+  if (Object.keys(patch).length === 0) return;
+  const active = lang || "en";
+  const current: Record<string, unknown> = isPlainObject(text.languageSettings)
+    ? { ...(text.languageSettings as Record<string, unknown>) }
+    : {};
+  const write = (code: string) => {
+    const prev = isPlainObject(current[code]) ? { ...(current[code] as Record<string, unknown>) } : {};
+    current[code] = { ...prev, ...patch };
+  };
+  write(active);
+  if (text.perLanguageLayout !== true) {
+    for (const code of Object.keys(current)) write(code);
+  }
+  text.languageSettings = current;
+}
 
 function applyTextShortcuts(text: Record<string, unknown>, settings: Record<string, unknown>, lang: string): void {
   if (typeof settings.headline === "string") {
@@ -537,9 +567,14 @@ function applyTextShortcuts(text: Record<string, unknown>, settings: Record<stri
   if (isPlainObject(settings.subheadlines)) text.subheadlines = { ...(text.subheadlines as object), ...settings.subheadlines };
   for (const key of TEXT_SHORTCUTS) {
     if (key === "headline" || key === "subheadline" || key === "headlines" || key === "subheadlines") continue;
+    if (key === "languageSettings") continue;
     if (FONT_ALIAS_KEYS.has(key)) continue;
     if (settings[key] !== undefined) text[key] = settings[key];
   }
+  if (isPlainObject(settings.languageSettings)) {
+    text.languageSettings = deepMerge(text.languageSettings || {}, settings.languageSettings);
+  }
+  applyEffectiveLayout(text, settings, lang);
   if (typeof settings.font === "string" && settings.headlineFont === undefined) {
     text.headlineFont = fontValue(settings.font);
   }
@@ -639,7 +674,13 @@ function applyLayerSettings(
     if (preset) applyPositionPreset(layer.screenshot, preset);
   }
   if (isPlainObject(normalized.text)) {
-    layer.text = deepMerge(layer.text, normalized.text);
+    const textPatch = normalized.text as Record<string, unknown>;
+    const stored: Record<string, unknown> = { ...textPatch };
+    for (const key of FONT_ALIAS_KEYS) delete stored[key];
+    delete stored.headline;
+    delete stored.subheadline;
+    layer.text = deepMerge(layer.text, stored);
+    applyTextShortcuts(layer.text, textPatch, lang);
   }
   if (typeof normalized.positionPreset === "string") {
     applyPositionPreset(layer.screenshot, normalized.positionPreset);
@@ -653,44 +694,224 @@ function applyLayerSettings(
   }
 }
 
-const RESERVED_GLOBAL = new Set([
-  "screenshots",
-  "id",
-  "formatVersion",
-  "background",
-  "screenshot",
-  "text",
-  "elements",
-  "popouts",
-  "positionPreset",
-  "outputDevice",
-  "customWidth",
-  "customHeight",
-  "panoramicBackground",
-  "panoramic",
-  "font_family",
-  "fontFamily",
-  "font_weight",
-  "fontWeight",
-  "headline_font_family",
-  "subheadline_font_family",
-  "headline_weight",
-  "subheadline_weight",
-  ...TEXT_SHORTCUTS,
+const BACKGROUND_KEYS = new Set([
+  "type",
+  "gradient",
+  "gradientPreset",
+  "solid",
+  "image",
+  "imageSrc",
+  "imageFit",
+  "imageBlur",
+  "imageOffsetX",
+  "imageOffsetY",
+  "imageScale",
+  "overlayColor",
+  "overlayOpacity",
+  "noise",
+  "noiseIntensity",
+  "image_base64",
+  "image_url",
 ]);
 
+const SHADOW_KEYS = new Set(["enabled", "color", "blur", "opacity", "x", "y"]);
+const FRAME_KEYS = new Set(["enabled", "color", "width", "opacity"]);
+const ROTATION_3D_KEYS = new Set(["x", "y", "z"]);
+const SCREENSHOT_LAYER_KEYS = new Set([
+  "scale",
+  "x",
+  "y",
+  "rotation",
+  "perspective",
+  "cornerRadius",
+  "use3D",
+  "device3D",
+  "rotation3D",
+  "shadow",
+  "frame",
+  "border",
+  "positionPreset",
+  "frameColor",
+]);
+const LAYOUT_KEYS = new Set(["headlineSize", "subheadlineSize", "position", "offsetY", "lineHeight"]);
+const PANORAMIC_KEYS = new Set(["enabled", "src", "imageSrc", "overlap", "scale", "offsetY"]);
+
+function textSettingKeys(): Set<string> {
+  return new Set<string>([...Object.keys(defaultText()), ...TEXT_SHORTCUTS, ...FONT_ALIAS_KEYS]);
+}
+
+function globalSettingKeys(): Set<string> {
+  return new Set<string>([
+    "language",
+    "width",
+    "height",
+    "apply_to",
+    "name",
+    "outputDevice",
+    "customWidth",
+    "customHeight",
+    "background",
+    "screenshot",
+    "text",
+    "elements",
+    "popouts",
+    "positionPreset",
+    "panoramicBackground",
+    "panoramic",
+    "gradientPreset",
+    "type",
+    "gradient",
+    "background_image_base64",
+    "background_image_url",
+    ...TEXT_SHORTCUTS,
+    ...FONT_ALIAS_KEYS,
+  ]);
+}
+
+function screenshotSettingKeys(): Set<string> {
+  return new Set<string>([
+    ...globalSettingKeys(),
+    "deviceType",
+    "src",
+    "localizedImages",
+    "image",
+  ]);
+}
+
+function rejectUnknown(paths: string[]): void {
+  if (paths.length === 0) return;
+  const listed = paths.map((path) => `"${path}"`).join(", ");
+  const noun = paths.length === 1 ? "setting" : "settings";
+  throw new ProjectError(
+    "unknown_setting",
+    `Unknown ${noun} ${listed}. Call describe_options for the fields these tools accept. font_family, font_weight, headline, and subheadline apply both under settings.text and at the top level of settings.`,
+  );
+}
+
+function collectUnknown(unknown: string[], path: string, value: Record<string, unknown>, allowed: Set<string>): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) unknown.push(`${path}.${key}`);
+  }
+}
+
+function assertObject(value: unknown, path: string): Record<string, unknown> {
+  if (!isPlainObject(value)) {
+    throw new ProjectError("invalid_setting", `${path} must be an object.`);
+  }
+  return value;
+}
+
+/** Reject keys the tools do not apply, instead of reporting success and storing them unused. */
+export function assertKnownSettings(settings: Record<string, unknown>, scope: "global" | "screenshot"): void {
+  const normalized = renameColourKeys(settings) as Record<string, unknown>;
+  const unknown: string[] = [];
+  collectUnknown(unknown, "settings", normalized, scope === "global" ? globalSettingKeys() : screenshotSettingKeys());
+
+  if (normalized.background !== undefined) {
+    const background = assertObject(normalized.background, "settings.background");
+    collectUnknown(unknown, "settings.background", background, BACKGROUND_KEYS);
+    if (background.gradient !== undefined) {
+      const gradient = assertObject(background.gradient, "settings.background.gradient");
+      collectUnknown(unknown, "settings.background.gradient", gradient, new Set(["angle", "stops"]));
+      if (gradient.stops !== undefined) {
+        if (!Array.isArray(gradient.stops)) {
+          throw new ProjectError("invalid_setting", "settings.background.gradient.stops must be an array.");
+        }
+        gradient.stops.forEach((stop, index) => {
+          const entry = assertObject(stop, `settings.background.gradient.stops[${index}]`);
+          collectUnknown(unknown, `settings.background.gradient.stops[${index}]`, entry, new Set(["color", "position"]));
+        });
+      }
+    }
+  }
+  if (normalized.screenshot !== undefined) {
+    const shot = assertObject(normalized.screenshot, "settings.screenshot");
+    collectUnknown(unknown, "settings.screenshot", shot, SCREENSHOT_LAYER_KEYS);
+    if (shot.shadow !== undefined) {
+      const shadow = assertObject(shot.shadow, "settings.screenshot.shadow");
+      collectUnknown(unknown, "settings.screenshot.shadow", shadow, SHADOW_KEYS);
+    }
+    for (const frameKey of ["frame", "border"] as const) {
+      if (shot[frameKey] !== undefined) {
+        const frame = assertObject(shot[frameKey], `settings.screenshot.${frameKey}`);
+        collectUnknown(unknown, `settings.screenshot.${frameKey}`, frame, FRAME_KEYS);
+      }
+    }
+    if (shot.rotation3D !== undefined) {
+      const rotation = assertObject(shot.rotation3D, "settings.screenshot.rotation3D");
+      collectUnknown(unknown, "settings.screenshot.rotation3D", rotation, ROTATION_3D_KEYS);
+    }
+  }
+  if (normalized.text !== undefined) {
+    const text = assertObject(normalized.text, "settings.text");
+    collectUnknown(unknown, "settings.text", text, textSettingKeys());
+    if (text.languageSettings !== undefined) {
+      const layouts = assertObject(text.languageSettings, "settings.text.languageSettings");
+      for (const [lang, layout] of Object.entries(layouts)) {
+        const entry = assertObject(layout, `settings.text.languageSettings.${lang}`);
+        collectUnknown(unknown, `settings.text.languageSettings.${lang}`, entry, LAYOUT_KEYS);
+      }
+    }
+  }
+  for (const panoKey of ["panoramic", "panoramicBackground"] as const) {
+    if (normalized[panoKey] !== undefined) {
+      const pano = assertObject(normalized[panoKey], `settings.${panoKey}`);
+      collectUnknown(unknown, `settings.${panoKey}`, pano, PANORAMIC_KEYS);
+    }
+  }
+  if (normalized.gradient !== undefined) {
+    const gradient = assertObject(normalized.gradient, "settings.gradient");
+    collectUnknown(unknown, "settings.gradient", gradient, new Set(["angle", "stops"]));
+  }
+  if (normalized.elements !== undefined && !Array.isArray(normalized.elements)) {
+    throw new ProjectError("invalid_setting", "settings.elements must be an array.");
+  }
+  if (normalized.popouts !== undefined && !Array.isArray(normalized.popouts)) {
+    throw new ProjectError("invalid_setting", "settings.popouts must be an array.");
+  }
+  rejectUnknown(unknown);
+  assertWrapSetting(normalized.headlineTextWrap, "settings.headlineTextWrap");
+  assertWrapSetting(normalized.subheadlineTextWrap, "settings.subheadlineTextWrap");
+  if (isPlainObject(normalized.text)) {
+    const text = normalized.text as Record<string, unknown>;
+    assertWrapSetting(text.headlineTextWrap, "settings.text.headlineTextWrap");
+    assertWrapSetting(text.subheadlineTextWrap, "settings.text.subheadlineTextWrap");
+  }
+}
+
+function assertWrapSetting(value: unknown, path: string): void {
+  if (value === undefined) return;
+  if (value !== "wrap" && value !== "balance") {
+    throw new ProjectError(
+      "unknown_setting",
+      `Invalid ${path} "${String(value)}". Use "wrap" or "balance".`,
+    );
+  }
+}
+
 export function updateGlobalSettings(dump: BackupDump, settings: Record<string, unknown>, applyTo: "all" | "defaults" = "all"): void {
+  assertKnownSettings(settings, "global");
   const project = primaryProject(dump);
   const lang = typeof settings.language === "string" ? settings.language : project.currentLanguage || "en";
   if (typeof settings.language === "string") {
     project.currentLanguage = settings.language;
     ensureLanguage(project, settings.language);
   }
-  if (typeof settings.outputDevice === "string" || settings.width || settings.height) {
+  const width = typeof settings.width === "number"
+    ? settings.width
+    : typeof settings.customWidth === "number"
+      ? settings.customWidth
+      : undefined;
+  const height = typeof settings.height === "number"
+    ? settings.height
+    : typeof settings.customHeight === "number"
+      ? settings.customHeight
+      : undefined;
+  if (typeof settings.outputDevice === "string" || width !== undefined || height !== undefined) {
     setOutputSize(dump, {
       device: typeof settings.outputDevice === "string" ? settings.outputDevice : undefined,
-      width: typeof settings.width === "number" ? settings.width : undefined,
-      height: typeof settings.height === "number" ? settings.height : undefined,
+      width,
+      height,
     });
   }
   applyLayerSettings(project.defaults, settings, lang);
@@ -717,19 +938,12 @@ export function updateGlobalSettings(dump: BackupDump, settings: Record<string, 
       if (Array.isArray(settings.popouts)) shot.popouts = clone(settings.popouts) as unknown[];
     }
   }
-  for (const [key, value] of Object.entries(settings)) {
-    if (RESERVED_GLOBAL.has(key) || key === "language" || key === "width" || key === "height" || key === "apply_to") continue;
-    if (key in project.defaults) {
-      (project.defaults as unknown as Record<string, unknown>)[key] = value;
-    } else if (key !== "gradientPreset") {
-      project[key] = value;
-    }
-  }
 }
 
 export function updateScreenshotSettings(dump: BackupDump, index: number, settings: Record<string, unknown>): void {
   const project = primaryProject(dump);
   const shot = screenshotAt(project, index);
+  assertKnownSettings(settings, "screenshot");
   const lang = typeof settings.language === "string" ? settings.language : project.currentLanguage || "en";
   if (typeof settings.language === "string") ensureLanguage(project, settings.language);
   applyLayerSettings(shot, settings, lang);
@@ -737,35 +951,6 @@ export function updateScreenshotSettings(dump: BackupDump, index: number, settin
   if (Array.isArray(settings.popouts)) shot.popouts = settings.popouts as unknown[];
   if (typeof settings.name === "string") shot.name = settings.name;
   if (typeof settings.deviceType === "string") shot.deviceType = settings.deviceType;
-  const known = new Set([
-    "background",
-    "screenshot",
-    "text",
-    "elements",
-    "popouts",
-    "positionPreset",
-    "name",
-    "deviceType",
-    "language",
-    "src",
-    "localizedImages",
-    "image",
-    "font_family",
-    "fontFamily",
-    "font_weight",
-    "fontWeight",
-    "headline_font_family",
-    "subheadline_font_family",
-    "headline_weight",
-    "subheadline_weight",
-    "background_image_base64",
-    "background_image_url",
-    ...TEXT_SHORTCUTS,
-  ]);
-  for (const [key, value] of Object.entries(renameColourKeys(settings) as Record<string, unknown>)) {
-    if (known.has(key)) continue;
-    shot[key] = value;
-  }
   project.selectedIndex = index;
 }
 
@@ -836,10 +1021,21 @@ export function summarizeScreenshot(shot: ScreenshotRecord, index: number): Reco
   };
 }
 
+function redactDataUrls(value: unknown): unknown {
+  if (typeof value === "string") return value.startsWith("data:image/") ? "data-url" : value;
+  if (Array.isArray(value)) return value.map(redactDataUrls);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) out[key] = redactDataUrls(child);
+    return out;
+  }
+  return value;
+}
+
 /** Strip bulky data URLs so get_project stays readable. */
 export function backupSummary(dump: BackupDump): Record<string, unknown> {
   const project = primaryProject(dump);
-  return {
+  return redactDataUrls({
     id: project.id,
     name: projectName(dump),
     formatVersion: project.formatVersion,
@@ -850,7 +1046,7 @@ export function backupSummary(dump: BackupDump): Record<string, unknown> {
     screenshotCount: project.screenshots.length,
     defaults: project.defaults,
     screenshots: project.screenshots.map((shot, index) => summarizeScreenshot(shot, index)),
-  };
+  }) as Record<string, unknown>;
 }
 
 export function bytesToBase64(bytes: Uint8Array): string {

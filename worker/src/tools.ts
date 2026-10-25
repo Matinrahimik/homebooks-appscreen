@@ -1,10 +1,11 @@
+import { assertPanoramaBytes, inlineAssetRefs, storeAsset } from "./assets.ts";
 import { findGradientPreset, backupSchema, describeOptions } from "./schema.ts";
 import {
   addScreenshot,
   assertPublicImageUrl,
   backupSummary,
+  clone,
   createBackup,
-  dataUrlFromBytes,
   decodeImageBase64,
   outputSizeOf,
   primaryProject,
@@ -22,12 +23,13 @@ import {
 } from "./project.ts";
 import {
   deleteProjectRecord,
-  getBackup,
   getEnvelope,
+  installProject,
   listProjectIndex,
+  modifyProject,
   putPublicFile,
+  readProjectDoc,
   rememberFile,
-  saveProject,
   type ProjectEnvelope,
 } from "./store.ts";
 import { zipStore } from "./zip.ts";
@@ -57,7 +59,7 @@ const imageProps = {
 const settingsSchema = {
   type: "object",
   description:
-    "Partial backup settings. background (gradient, solid, imageSrc, imageOffsetX/Y, imageScale), screenshot (positionPreset, use3D, device3D, scale up to 200, x/y that may leave the canvas, rotation3D {x,y,z}, shadow, frame), and text (font_family, font_weight, textGap, textGapUnit, headlineLetterSpacing, subheadlineLetterSpacing) deep-merge. colour is accepted as an alias of color.",
+    "Partial backup settings. background, screenshot, and text deep-merge. Text aliases (font_family, font_weight, headline, subheadline, textGap, letter spacing, headlineSize, headlineTextWrap, subheadlineTextWrap) apply under settings.text and at the top level. headlineSize also writes text.languageSettings for the active language, because that entry overrides the global size when per-language layout is on. headlineTextWrap and subheadlineTextWrap are wrap or balance. At scale 100 the 3D phone is about 108% of the canvas height. Unknown keys are an error. colour is an alias of color.",
   additionalProperties: true,
 };
 
@@ -82,7 +84,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "get_project",
     description:
-      "Fetch a project summary and its live edit URL. Set include_backup to return the full Export/Import backup JSON (large when screenshots are embedded).",
+      "Fetch a project summary and its live edit URL. Set include_backup to return the self-contained Export/Import backup JSON with image data URLs. The stored project document keeps images as asset refs, so a settings edit does not rewrite them.",
     inputSchema: {
       type: "object",
       properties: {
@@ -175,7 +177,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "update_screenshot_settings",
     description:
-      "Update one screenshot: background (gradient, solid, image), 2D/3D device and position preset, scale, rotation, shadow, frame, headline and subheadline text, font, weight, size, colour, and position. Other backup fields are deep-merged.",
+      "Update one screenshot: background (gradient, solid, image), 2D/3D device and position preset, scale, rotation, shadow, frame, and text. settings.text and settings.screenshot objects apply, and the same text aliases work at the top level. This writes only the small project JSON. Unknown keys are an error. At scale 100 the 3D phone is about 108% of the canvas height. headlineSize writes text.languageSettings.<lang>.headlineSize as well as the global size.",
     inputSchema: {
       type: "object",
       properties: {
@@ -190,7 +192,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "set_panoramic_background",
     description:
-      "Use one wide image as a background sliced across screenshots in order. overlap is 0–0.8 (share of each slice). scale is percent. offset_y shifts the crop vertically, as a percent of image height. Omit the image to change overlap, scale, or offset only.",
+      "Use one wide image as a background sliced across screenshots in order. overlap is 0–0.8 (share of each slice). scale is percent. offset_y shifts the crop vertically, as a percent of image height. Omit the image to change overlap, scale, or offset only. A new panorama must be 8 MiB or smaller.",
     inputSchema: {
       type: "object",
       properties: {
@@ -307,14 +309,23 @@ async function requireProject(services: Services, projectId: string): Promise<{ 
     throw new ProjectError("invalid_request", "project_id is required.");
   }
   const envelope = await getEnvelope(services.env.APPSCREEN_KV, projectId);
-  const backup = await getBackup(services.env.APPSCREEN_KV, projectId);
-  if (!envelope || !backup) throw new ProjectError("not_found", `Project ${projectId} was not found.`);
-  return { envelope, backup };
+  const loaded = envelope ? await readProjectDoc(services.env, projectId) : null;
+  if (!envelope || !loaded) throw new ProjectError("not_found", `Project ${projectId} was not found.`);
+  return { envelope, backup: loaded.backup };
 }
 
-async function persist(services: Services, envelope: ProjectEnvelope, backup: BackupDump): Promise<void> {
-  envelope.updatedAt = nowIso(services);
-  await saveProject(services.env.APPSCREEN_KV, envelope, backup);
+async function editProject(
+  services: Services,
+  projectId: string,
+  mutate: (draft: BackupDump) => void | Promise<void>,
+): Promise<{ envelope: ProjectEnvelope; backup: BackupDump }> {
+  if (!projectId || typeof projectId !== "string") {
+    throw new ProjectError("invalid_request", "project_id is required.");
+  }
+  const backup = await modifyProject(services.env, projectId, mutate, nowIso(services));
+  const envelope = await getEnvelope(services.env.APPSCREEN_KV, projectId);
+  if (!envelope) throw new ProjectError("not_found", `Project ${projectId} was not found.`);
+  return { envelope, backup };
 }
 
 function resolveGradients(settings: Record<string, unknown>): void {
@@ -351,27 +362,28 @@ async function applyBackgroundImageArgs(services: Services, settings: Record<str
       ? bg.image_url
       : "";
   if (!b64.trim() && !url.trim()) return;
-  const image = await loadImageData(services, { image_base64: b64, image_url: url });
-  settings.background = { ...bg, type: "image", imageSrc: image.dataUrl, image: null };
+  const image = await loadImageBytes(services, { image_base64: b64, image_url: url });
+  const ref = await storeAsset(services.env.APPSCREEN_KV, image.bytes, image.mime);
+  settings.background = { ...bg, type: "image", imageSrc: ref, image: null };
   delete (settings.background as Record<string, unknown>).image_base64;
   delete (settings.background as Record<string, unknown>).image_url;
   delete settings.background_image_base64;
   delete settings.background_image_url;
 }
 
-async function loadImageData(services: Services, args: Record<string, unknown>): Promise<{ dataUrl: string; name?: string; language?: string; deviceType?: string }> {
+async function loadImageBytes(services: Services, args: Record<string, unknown>): Promise<{ mime: string; bytes: Uint8Array; name?: string; language?: string; deviceType?: string }> {
   const named = typeof args.name === "string" ? args.name : undefined;
   const language = typeof args.language === "string" ? args.language : undefined;
   const deviceType = typeof args.device_type === "string" ? args.device_type : undefined;
   if (typeof args.image_base64 === "string" && args.image_base64.trim()) {
     const decoded = decodeImageBase64(args.image_base64);
-    return { dataUrl: dataUrlFromBytes(decoded.mime, decoded.bytes), name: named, language, deviceType };
+    return { mime: decoded.mime, bytes: decoded.bytes, name: named, language, deviceType };
   }
   if (typeof args.image_url === "string" && args.image_url.trim()) {
     assertPublicImageUrl(args.image_url);
     const loader = services.loadImage || defaultLoadImage;
     const loaded = await loader(args.image_url);
-    return { dataUrl: dataUrlFromBytes(loaded.mime, loaded.bytes), name: named, language, deviceType };
+    return { mime: loaded.mime, bytes: loaded.bytes, name: named, language, deviceType };
   }
   throw new ProjectError("invalid_image", "Provide image_url or image_base64.");
 }
@@ -445,7 +457,7 @@ export async function callTool(services: Services, name: string, args: Record<st
         screenshotCount: 0,
         fileTokens: [],
       };
-      await saveProject(services.env.APPSCREEN_KV, envelope, backup);
+      await installProject(services.env, envelope, backup);
       return {
         data: {
           project_id: id,
@@ -470,44 +482,50 @@ export async function callTool(services: Services, name: string, args: Record<st
         output: outputSizeOf(project),
         summary: backupSummary(backup),
       };
-      if (args.include_backup === true) data.backup = backup;
+      if (args.include_backup === true) data.backup = await inlineAssetRefs(services.env.APPSCREEN_KV, clone(backup));
       return { data };
     }
     case "delete_project": {
       const id = String(args.project_id || "");
-      const removed = await deleteProjectRecord(services.env.APPSCREEN_KV, id);
+      const removed = await deleteProjectRecord(services.env, id);
       if (!removed) throw new ProjectError("not_found", `Project ${id} was not found.`);
       return { data: { deleted: true, project_id: id } };
     }
     case "add_screenshot": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
-      const image = await loadImageData(services, args);
-      const index = addScreenshot(backup, image, Number.isInteger(args.index) ? Number(args.index) : undefined);
-      await persist(services, envelope, backup);
+      const image = await loadImageBytes(services, args);
+      const ref = await storeAsset(services.env.APPSCREEN_KV, image.bytes, image.mime);
+      const indexArg = Number.isInteger(args.index) ? Number(args.index) : undefined;
+      let index = 0;
+      const { envelope, backup } = await editProject(services, String(args.project_id || ""), (draft) => {
+        index = addScreenshot(draft, { ...image, dataUrl: ref }, indexArg);
+      });
       return { data: { project_id: envelope.id, index, screenshot_count: primaryProject(backup).screenshots.length } };
     }
     case "replace_screenshot": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
-      const image = await loadImageData(services, args);
-      replaceScreenshot(backup, Number(args.index), image);
-      await persist(services, envelope, backup);
-      return { data: { project_id: envelope.id, index: Number(args.index) } };
+      const image = await loadImageBytes(services, args);
+      const ref = await storeAsset(services.env.APPSCREEN_KV, image.bytes, image.mime);
+      const index = Number(args.index);
+      const { envelope } = await editProject(services, String(args.project_id || ""), (draft) => {
+        replaceScreenshot(draft, index, { ...image, dataUrl: ref });
+      });
+      return { data: { project_id: envelope.id, index } };
     }
     case "reorder_screenshots": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       if (!Array.isArray(args.order)) throw new ProjectError("invalid_order", "order must be an array of indexes.");
-      reorderScreenshots(backup, args.order.map((n) => Number(n)));
-      await persist(services, envelope, backup);
+      const order = args.order.map((n) => Number(n));
+      const { envelope } = await editProject(services, String(args.project_id || ""), (draft) => {
+        reorderScreenshots(draft, order);
+      });
       return { data: { project_id: envelope.id, order: args.order } };
     }
     case "remove_screenshot": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
-      removeScreenshot(backup, Number(args.index));
-      await persist(services, envelope, backup);
+      const index = Number(args.index);
+      const { envelope, backup } = await editProject(services, String(args.project_id || ""), (draft) => {
+        removeScreenshot(draft, index);
+      });
       return { data: { project_id: envelope.id, screenshot_count: primaryProject(backup).screenshots.length } };
     }
     case "update_global_settings": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       if (!args.settings || typeof args.settings !== "object" || Array.isArray(args.settings)) {
         throw new ProjectError("invalid_request", "settings object is required.");
       }
@@ -515,38 +533,42 @@ export async function callTool(services: Services, name: string, args: Record<st
       resolveGradients(settings);
       await applyBackgroundImageArgs(services, settings);
       const applyTo = args.apply_to === "defaults" ? "defaults" : "all";
-      updateGlobalSettings(backup, settings, applyTo);
-      if (typeof settings.name === "string") setProjectName(backup, settings.name);
-      await persist(services, envelope, backup);
+      const { envelope, backup } = await editProject(services, String(args.project_id || ""), (draft) => {
+        updateGlobalSettings(draft, settings, applyTo);
+        if (typeof settings.name === "string") setProjectName(draft, settings.name);
+      });
       return { data: { project_id: envelope.id, summary: backupSummary(backup) } };
     }
     case "update_screenshot_settings": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       if (!args.settings || typeof args.settings !== "object" || Array.isArray(args.settings)) {
         throw new ProjectError("invalid_request", "settings object is required.");
       }
       const settings = { ...(args.settings as Record<string, unknown>) };
       resolveGradients(settings);
       await applyBackgroundImageArgs(services, settings);
-      updateScreenshotSettings(backup, Number(args.index), settings);
-      await persist(services, envelope, backup);
-      return { data: { project_id: envelope.id, index: Number(args.index), summary: backupSummary(backup) } };
+      const index = Number(args.index);
+      const { envelope, backup } = await editProject(services, String(args.project_id || ""), (draft) => {
+        updateScreenshotSettings(draft, index, settings);
+      });
+      return { data: { project_id: envelope.id, index, summary: backupSummary(backup) } };
     }
     case "set_panoramic_background": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       let src: string | undefined;
       if ((typeof args.image_base64 === "string" && args.image_base64.trim()) || (typeof args.image_url === "string" && args.image_url.trim())) {
-        const image = await loadImageData(services, args);
-        src = image.dataUrl;
+        const image = await loadImageBytes(services, args);
+        assertPanoramaBytes(image.bytes.byteLength);
+        src = await storeAsset(services.env.APPSCREEN_KV, image.bytes, image.mime);
       }
-      const pano = setPanoramicBackground(backup, {
-        src,
-        enabled: typeof args.enabled === "boolean" ? args.enabled : undefined,
-        overlap: typeof args.overlap === "number" ? args.overlap : undefined,
-        scale: typeof args.scale === "number" ? args.scale : undefined,
-        offsetY: typeof args.offset_y === "number" ? args.offset_y : undefined,
+      let pano: Record<string, unknown> = {};
+      const { envelope } = await editProject(services, String(args.project_id || ""), (draft) => {
+        pano = setPanoramicBackground(draft, {
+          src,
+          enabled: typeof args.enabled === "boolean" ? args.enabled : undefined,
+          overlap: typeof args.overlap === "number" ? args.overlap : undefined,
+          scale: typeof args.scale === "number" ? args.scale : undefined,
+          offsetY: typeof args.offset_y === "number" ? args.offset_y : undefined,
+        });
       });
-      await persist(services, envelope, backup);
       return {
         data: {
           project_id: envelope.id,
@@ -561,16 +583,17 @@ export async function callTool(services: Services, name: string, args: Record<st
       };
     }
     case "set_output_size": {
-      const { envelope, backup } = await requireProject(services, String(args.project_id || ""));
       if (typeof args.device !== "string" && typeof args.width !== "number" && typeof args.height !== "number") {
         throw new ProjectError("invalid_size", "Provide device, or width and height for a custom size.");
       }
-      const size = setOutputSize(backup, {
-        device: typeof args.device === "string" ? args.device : undefined,
-        width: typeof args.width === "number" ? args.width : undefined,
-        height: typeof args.height === "number" ? args.height : undefined,
+      let size: { device: string; width: number; height: number } = { device: "custom", width: 0, height: 0 };
+      const { envelope } = await editProject(services, String(args.project_id || ""), (draft) => {
+        size = setOutputSize(draft, {
+          device: typeof args.device === "string" ? args.device : undefined,
+          width: typeof args.width === "number" ? args.width : undefined,
+          height: typeof args.height === "number" ? args.height : undefined,
+        });
       });
-      await persist(services, envelope, backup);
       return { data: { project_id: envelope.id, ...size } };
     }
     case "render_preview": {

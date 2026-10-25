@@ -208,11 +208,18 @@ describe("mcp tools", () => {
     assert.equal(backup.projects[0].screenshots[0].screenshot.scale, 150);
     assert.equal(backup.projects[0].screenshots[0].screenshot.y, 170);
     assert.equal(backup.projects[0].screenshots[0].screenshot.rotation3D.x, 12);
-    assert.equal(backup.projects[0].screenshots[0].background.imageSrc, "data:image/png;base64,QQ==");
+    assert.match(backup.projects[0].screenshots[0].background.imageSrc, /\/assets\/[a-f0-9]{64}$/);
     assert.equal(backup.projects[0].screenshots[0].background.imageOffsetX, 12);
     assert.equal(backup.projects[0].screenshots[0].background.imageScale, 130);
     assert.equal(backup.projects[0].panoramicBackground.overlap, 0.25);
-    assert.match(backup.projects[0].panoramicBackground.src, /^data:image\/png/);
+    assert.match(backup.projects[0].panoramicBackground.src, /\/assets\/[a-f0-9]{64}$/);
+    const asset = await route(new Request(backup.projects[0].screenshots[0].background.imageSrc, {
+      headers: { origin: "https://matinrahimik.github.io" },
+    }), e);
+    assert.equal(asset.status, 200);
+    assert.equal(asset.headers.get("content-type"), "image/png");
+    assert.equal(asset.headers.get("access-control-allow-origin"), "https://matinrahimik.github.io");
+    assert.equal(new Uint8Array(await asset.arrayBuffer())[0], 65);
     assert.ok(backup.meta.some((m) => m.key === "projects"));
 
     const denied = await route(new Request(`https://homebooks-appscreen-mcp.matinrahimi.workers.dev/api/projects/${id}`), e);
@@ -228,18 +235,74 @@ describe("mcp tools", () => {
     assert.equal(saved.headers.get("access-control-allow-origin"), "https://matinrahimik.github.io");
 
     const again = toolData(await rpc(e, "tools/call", { name: "get_project", arguments: { project_id: id, include_backup: true } }));
-    const roundTrip = again.backup as { projects: { screenshots: { text: { headlines: { en: string } } }[] }[] };
+    const roundTrip = again.backup as { projects: { screenshots: { text: { headlines: { en: string } }; background: { imageSrc: string } }[]; panoramicBackground: { src: string } }[] };
     assert.equal(roundTrip.projects[0].screenshots[0].text.headlines.en, "Edited in the app");
+    assert.match(roundTrip.projects[0].screenshots[0].background.imageSrc, /^data:image\/png;base64,/);
+    assert.match(roundTrip.projects[0].panoramicBackground.src, /^data:image\/png;base64,/);
 
     const options = toolData(await rpc(e, "tools/call", { name: "describe_options", arguments: {} }));
     assert.ok((options.positionPresets as { "tilt-left": { rotation: number } })["tilt-left"].rotation === -8);
+    const optionsText = JSON.stringify(options);
+    assert.match(optionsText, /108%/);
+    assert.match(optionsText, /languageSettings\.<lang>\.headlineSize/);
+    assert.deepEqual((options.textWrap as { headlineTextWrap: string[] }).headlineTextWrap, ["wrap", "balance"]);
     const schema = toolData(await rpc(e, "tools/call", { name: "get_schema", arguments: {} }));
-    assert.ok(schema.backup);
+    const schemaText = JSON.stringify(schema);
+    assert.match(schemaText, /108%/);
+    assert.match(schemaText, /headlineSize/);
+    assert.match(schemaText, /headlineTextWrap/);
 
     const removed = toolData(await rpc(e, "tools/call", { name: "delete_project", arguments: { project_id: id } }));
     assert.equal(removed.deleted, true);
     const missing = await rpc(e, "tools/call", { name: "get_project", arguments: { project_id: id } });
     assert.equal(missing.json.result?.isError, true);
+  });
+
+  it("applies settings.text and returns an error for unknown keys", async () => {
+    const e = env();
+    const created = toolData(await rpc(e, "tools/call", { name: "create_project", arguments: { name: "HomeBooks" } }));
+    const id = String(created.project_id);
+    const tiny = Buffer.from([137, 80, 78, 71]).toString("base64");
+    toolData(await rpc(e, "tools/call", {
+      name: "add_screenshot",
+      arguments: { project_id: id, image_base64: tiny },
+    }));
+    const styled = toolData(await rpc(e, "tools/call", {
+      name: "update_global_settings",
+      arguments: {
+        project_id: id,
+        settings: {
+          text: {
+            font_family: "Rubik",
+            font_weight: "600",
+            headline: "Nested headline",
+            subheadline: "Nested subheadline",
+          },
+        },
+      },
+    }));
+    const summary = styled.summary as {
+      defaults: { screenshot: { y: number; scale: number }; text: { headlineFont: string; headlineWeight: string; subheadlines: { en: string } } };
+      screenshots: { headlineFont: string; headlines: { en: string }; subheadlines: { en: string } }[];
+    };
+    assert.equal(summary.defaults.screenshot.y, 100);
+    assert.equal(summary.defaults.screenshot.scale, 70);
+    assert.equal(summary.defaults.text.headlineFont, "'Rubik', sans-serif");
+    assert.equal(summary.defaults.text.headlineWeight, "600");
+    assert.equal(summary.defaults.text.subheadlines.en, "Nested subheadline");
+    assert.equal(summary.screenshots[0].headlineFont, "'Rubik', sans-serif");
+    assert.equal(summary.screenshots[0].headlines.en, "Nested headline");
+    assert.equal(summary.screenshots[0].subheadlines.en, "Nested subheadline");
+
+    const rejected = await rpc(e, "tools/call", {
+      name: "update_screenshot_settings",
+      arguments: { project_id: id, index: 0, settings: { text: { font_family: "Rubik", not_a_field: true } } },
+    });
+    assert.equal(rejected.json.result?.isError, true);
+    assert.match(rejected.json.result?.content?.[0].text || "", /Unknown setting "settings\.text\.not_a_field"/);
+    const still = toolData(await rpc(e, "tools/call", { name: "get_project", arguments: { project_id: id } }));
+    const after = still.summary as { screenshots: { headlineFont: string }[] };
+    assert.equal(after.screenshots[0].headlineFont, "'Rubik', sans-serif");
   });
 
   it("ships upload metadata for the Workers script API", () => {
@@ -252,5 +315,10 @@ describe("mcp tools", () => {
     assert.equal(kv.name, "APPSCREEN_KV");
     assert.equal(kv.namespace_id, "__KV_NAMESPACE_ID__");
     assert.equal(browser.name, "BROWSER");
+    const gate = metadata.bindings.find((binding: { name: string }) => binding.name === "PROJECT_GATE");
+    assert.equal(gate.type, "durable_object_namespace");
+    assert.equal(gate.class_name, "ProjectGate");
+    assert.equal(metadata.migrations[0].tag, "v1-project-gate");
+    assert.deepEqual(metadata.migrations[0].new_sqlite_classes, ["ProjectGate"]);
   });
 });

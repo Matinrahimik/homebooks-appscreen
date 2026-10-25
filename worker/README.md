@@ -57,6 +57,9 @@ Bindings in that metadata:
 - `BROWSER` — `browser` (Cloudflare Browser Rendering)
 - `PAGES_ORIGIN` — `https://matinrahimik.github.io`
 - `PAGES_PATH` — `/homebooks-appscreen/`
+- `PROJECT_GATE` — `durable_object_namespace`, class `ProjectGate`
+
+The first upload also sends a migration (`tag` `v1-project-gate`, `new_sqlite_classes`: `ProjectGate`). SQLite-backed Durable Objects are required for a new class. Do not add a second migration with the same tag.
 
 Compatibility date `2026-10-25`, flag `nodejs_compat`.
 
@@ -90,10 +93,13 @@ CORS allows `https://matinrahimik.github.io` and `http://localhost` / `http://12
 | --- | --- | --- | --- |
 | `GET` | `/api/projects/:id` | `X-Edit-Key` or MCP bearer | — |
 | `PUT` | `/api/projects/:id` | `X-Edit-Key` or MCP bearer | backup JSON |
+| `GET` | `/assets/:sha256` | none (content hash) | image bytes, CORS for Pages and localhost |
 | `GET` | `/f/:token/:filename` | none (unguessable token) | PNG or ZIP bytes |
 | `POST` | `/mcp` | MCP bearer | JSON-RPC |
 
-`GET` and `PUT` use the same JSON as **Export Project Backup** / **Import Project Backup**:
+`GET /api/projects/:id` returns the backup JSON with image fields rewritten to `https://<worker>/assets/<sha256>` so the editor does not download or upload the pixels on a settings change. `PUT` accepts those URLs, `asset:<sha256>` refs, or a self-contained backup whose images are still data URLs. `get_project` with `include_backup: true` returns the original self-contained Export/Import backup.
+
+The on-disk shape the app exports is still:
 
 ```json
 {
@@ -105,9 +111,11 @@ CORS allows `https://matinrahimik.github.io` and `http://localhost` / `http://12
 }
 ```
 
-Screenshot images are data URLs on `localizedImages.<lang>.src` and the legacy `src` field.
+In a full export, screenshot images are data URLs on `localizedImages.<lang>.src` and the legacy `src` field. While a project is stored, each screenshot, background image, and panorama is its own KV blob (8 MiB chunks when needed) keyed by SHA-256. The project document keeps `asset:<hash>` refs, so a settings edit rewrites only that small JSON.
 
-KV values are capped at 25 MiB. Project JSON and exported blobs are stored in 8 MiB chunks. Anything that would exceed 80 MiB total, or a single image over 15 MiB, is rejected with a clear error instead of a partial write.
+An existing project whose backup still embeds data URLs, including a large panorama, is split into those blobs the first time it is read or written. The old chunked backup is deleted only after the small document is saved.
+
+KV values are capped at 25 MiB. Exported files and image blobs are stored in 8 MiB chunks, up to 80 MiB. A single screenshot upload over 15 MiB is rejected. A new panoramic upload over 8 MiB is rejected with an error that asks for a smaller JPEG; a panorama already stored on a project is kept. Settings edits do not base64-decode images.
 
 ## Live editor and headless render
 
@@ -375,13 +383,13 @@ Returns `pngs[]` (one public URL each) and `zip_url`.
 
 ### describe_options
 
-`{}` → output devices, position presets, gradient presets, system and popular Google fonts, 3D devices, frame colours, shadow and frame fields. Any Google Fonts family name is accepted, not only the popular list.
+`{}` → output devices, position presets, gradient presets, system and popular Google fonts, 3D devices, frame colours, shadow and frame fields. Any Google Fonts family name is accepted, not only the popular list. At scale 100 the 3D phone is about 108% of the canvas height. `text.languageSettings.<lang>.headlineSize` overrides the global headline size when per-language layout is on; a plain `headlineSize` write updates that entry. `headlineTextWrap` and `subheadlineTextWrap` are `wrap` or `balance`.
 
 ## Caveats
 
 - **Browser Rendering on the Workers Free plan** is capped at [10 minutes of browser time per UTC day](https://developers.cloudflare.com/browser-run/limits/). Over the cap, new sessions fail with HTTP 429 until the next UTC day. Paid plans have a higher allowance. Each preview or export launches a browser, loads the Pages app, the 3D model (when needed), and Google Fonts.
 - Rendering does nothing useful until the Pages site is deployed and Browser Rendering is enabled. The Worker and the Pages origin must both be public so the headless browser can load the app and the app can fetch the project.
-- KV is eventually consistent and each value is at most 25 MiB. Exports and projects are chunked, then rejected above 80 MiB. This is not a substitute for object storage.
+- KV is eventually consistent and each value is at most 25 MiB. Image blobs and exports are chunked, then rejected above 80 MiB. The project document itself stays small. Writes to one project are serialized by a Durable Object (`ProjectGate`) with compare-and-swap, so parallel `add_screenshot` calls do not drop screenshots or tear chunk metadata. This is not a substitute for object storage.
 - The edit URL is a capability link. Anyone with `project` and `key` can read and overwrite that project. It is not the MCP token. The token can read and write every project.
 - Last write wins between the agent and the open editor. The editor does not live-reload remote changes until the page is opened again.
 - Noise overlay uses `Math.random`, so those frames are not pixel-stable between renders.

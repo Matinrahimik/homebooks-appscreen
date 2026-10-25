@@ -117,7 +117,7 @@ export function describeOptions(): Record<string, unknown> {
     systemFonts: SYSTEM_FONTS,
     popularGoogleFonts: POPULAR_GOOGLE_FONTS,
     fontsNote:
-      "font_family plus font_weight (or headlineFont / subheadlineFont) accept any Google Fonts family, including Rubik, or a CSS font-family stack. The hosted app loads the face with FontFace and waits for document.fonts.ready before render-ready.",
+      "font_family plus font_weight (or headlineFont / subheadlineFont) accept any Google Fonts family, including Rubik, or a CSS font-family stack. Pass them under settings.text or at the top level of settings. The hosted app loads the face with FontFace and waits for document.fonts.ready before render-ready. Unknown setting keys are rejected.",
     textSpacing: {
       textGap: "number. Gap between headline and subheadline.",
       textGapUnit: ["px", "percent"],
@@ -127,17 +127,24 @@ export function describeOptions(): Record<string, unknown> {
     backgroundImage: ["imageSrc", "imageFit", "imageOffsetX", "imageOffsetY", "imageScale", "imageBlur", "overlayColor", "overlayOpacity"],
     panoramicBackground: {
       enabled: "boolean",
-      src: "data URL of one wide image sliced across screenshots in order",
+      src: "One wide image sliced across screenshots in order. Stored as an asset ref; export/import still uses a data URL. New uploads are capped at 8 MiB.",
       overlap: "0 to 0.8, fraction of each slice shared with the next",
       scale: "percent",
       offsetY: "percent of image height",
     },
     deviceFraming: {
-      scale: "percent. The editor allows at least 30–200. Values above 100 zoom past the canvas.",
+      scale: "percent. The editor allows at least 30–200. Values above 100 zoom past the canvas. At scale 100 the 3D phone is about 108% of the canvas height.",
       x: "percent. Below 0 or above 100 moves the device off the sides. Not clamped to the canvas.",
       y: "percent. Below 0 or above 100 moves the device off the top or bottom.",
       rotation: "2D degrees",
       rotation3D: "{ x, y, z } degrees",
+    },
+    headlineSize:
+      "Pixels. text.languageSettings.<lang>.headlineSize is what the canvas draws when perLanguageLayout is true, and it overrides the global text.headlineSize. A plain headlineSize setting writes the global size and that language entry (every language entry when per-language layout is off) so the language value does not silently win.",
+    textWrap: {
+      headlineTextWrap: ["wrap", "balance"],
+      subheadlineTextWrap: ["wrap", "balance"],
+      note: "balance keeps the same line count as wrap and narrows the measure so the lines are closer in length.",
     },
     devices3D: ["iphone", "samsung"],
     frameColor3D: FRAME_COLORS_3D,
@@ -179,8 +186,8 @@ export function backupSchema(): Record<string, unknown> {
               deviceType: "iPhone | iPad",
               localizedImages: { en: { src: "data-url", name: "string" } },
               background: "see describe_options",
-              screenshot: "2D/3D placement, shadow, frame",
-              text: "headlines, subheadlines, fonts, weights, sizes, colours, position",
+              screenshot: "2D/3D placement, shadow, frame. At scale 100 the 3D phone is about 108% of the canvas height.",
+              text: "headlines, subheadlines, fonts, weights, sizes, colours, position, headlineTextWrap, subheadlineTextWrap. text.languageSettings.<lang>.headlineSize overrides the global headlineSize when perLanguageLayout is true. A plain headlineSize write updates both.",
               elements: [],
               popouts: [],
               overrides: {},
