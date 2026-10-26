@@ -18,6 +18,7 @@ export interface BrowserLimits {
 interface BrowserPage {
   setViewport(viewport: { width: number; height: number; deviceScaleFactor: number }): Promise<unknown>;
   setCacheEnabled?(enabled: boolean): Promise<void>;
+  on?(event: string, handler: (payload: unknown) => void): void;
   goto(url: string, options: { waitUntil: string; timeout: number }): Promise<unknown>;
   waitForFunction(fn: () => boolean, options: { timeout: number }): Promise<unknown>;
   evaluate<T>(fn: (...args: never[]) => T): Promise<T>;
@@ -26,6 +27,7 @@ interface BrowserPage {
 
 interface BrowserHandle {
   newPage(): Promise<BrowserPage>;
+  version?(): Promise<string>;
   disconnect?: () => Promise<void>;
   close?: () => Promise<void>;
 }
@@ -62,19 +64,68 @@ export function acquisitionWaitMs(value: number | undefined): number | null {
   return Math.round(value);
 }
 
+/**
+ * Cloudflare's daily cap is `Browser time limit exceeded for today`, not the
+ * per-minute new-browser 429. A wait of half an hour or more is the same cap
+ * when the message text is generic.
+ */
+export function isDailyBrowserAllowance(cause: unknown, limits?: BrowserLimits | null): boolean {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  if (/browser time limit exceeded|exceeded for today|daily browser|per day|duration quota/i.test(raw)) return true;
+  const wait = acquisitionWaitMs(limits?.timeUntilNextAllowedBrowserAcquisition);
+  return wait != null && wait >= 30 * 60 * 1000;
+}
+
 export function browserRateLimitError(cause: unknown, limits?: BrowserLimits | null): Error {
   const raw = cause instanceof Error ? cause.message : String(cause);
+  if (isDailyBrowserAllowance(cause, limits)) {
+    return new Error(
+      `Browser Rendering daily allowance is exhausted. The Workers Free plan includes about 10 minutes of browser time per UTC day. ${raw}. Retry after the daily reset at 00:00 UTC. This is not the per-minute new-browser limit, and launching again will not help until the allowance resets.`,
+    );
+  }
   const waitMs = acquisitionWaitMs(limits?.timeUntilNextAllowedBrowserAcquisition);
   const seconds = waitMs != null ? Math.max(1, Math.ceil(waitMs / 1000)) : 60;
-  const daily = /daily|browser hours|duration quota/i.test(raw)
-    ? " If the message is the free-plan daily browser-time cap, retry after that allowance resets."
-    : "";
   return new Error(
-    `Browser Rendering rate limit: ${raw}. retry-after: ${seconds} seconds. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A healthy disconnected session is reused. A failed render closes its session.${daily}`,
+    `Browser Rendering rate limit: ${raw}. retry-after: ${seconds} seconds. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A healthy session is reused, including after a page error. A browser that stops answering is closed.`,
   );
 }
 
-async function connectFreeSession(puppeteer: PuppeteerBinding, endpoint: unknown): Promise<BrowserHandle | null> {
+/** CDP/browser failures. A page that reports its own error is not poisoned. */
+export function isPoisonedBrowser(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /protocol error|target closed|session closed|browser has disconnected|browser closed|websocket|connection closed|ECONNRESET|crashed|most likely the page has been closed|not ready yet/i.test(message);
+}
+
+async function browserHealthy(browser: BrowserHandle): Promise<boolean> {
+  if (typeof browser.version !== "function") return true;
+  try {
+    await browser.version();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function closeQuietly(browser: BrowserHandle): Promise<void> {
+  if (typeof browser.close !== "function") return;
+  try {
+    await browser.close();
+  } catch {
+    /* The session is already gone. */
+  }
+}
+
+/**
+ * Reuse a session that answers `version()`. Sessions with a connectionId are
+ * skipped unless `includeConnected` is set, which is only used when a new
+ * launch is not allowed and the previous call may have died mid-connection.
+ * A session that connects but does not answer is closed.
+ */
+async function takeReusableSession(
+  puppeteer: PuppeteerBinding,
+  endpoint: unknown,
+  includeConnected: boolean,
+): Promise<BrowserHandle | null> {
   let sessions: BrowserSessionInfo[] = [];
   try {
     sessions = await puppeteer.sessions(endpoint);
@@ -82,12 +133,17 @@ async function connectFreeSession(puppeteer: PuppeteerBinding, endpoint: unknown
     return null;
   }
   for (const session of sessions) {
-    if (!session?.sessionId || session.connectionId) continue;
+    if (!session?.sessionId) continue;
+    if (session.connectionId && !includeConnected) continue;
+    let handle: BrowserHandle;
     try {
-      return await puppeteer.connect(endpoint, session.sessionId);
+      handle = await puppeteer.connect(endpoint, session.sessionId);
     } catch {
-      /* Session was taken or is not healthy. Try the next one, then launch. */
+      continue;
     }
+    if (await browserHealthy(handle)) return handle;
+    logStage("browser_closed", { reason: "unhealthy" });
+    await closeQuietly(handle);
   }
   return null;
 }
@@ -102,17 +158,18 @@ async function readLimits(puppeteer: PuppeteerBinding, endpoint: unknown): Promi
 }
 
 /**
- * Reuse a session that disconnected cleanly. Otherwise launch, at most twice.
- * There is no sleep loop: a 429 reads the limit once, reuses a free session if
- * one appeared, and otherwise returns retry-after. A second launch happens only
- * when the account still allows an acquisition.
+ * Reuse a session that answers. Otherwise launch, at most twice.
+ * There is no sleep loop. A 429 reads limits(), reuses a free or still-connected
+ * session if one answers, and otherwise returns retry-after. A second launch
+ * happens only when the account still allows an acquisition. The daily
+ * allowance is reported on its own, not as a one-minute wait.
  */
 export async function acquireBrowser(
   puppeteer: PuppeteerBinding,
   endpoint: unknown,
   _wait: (ms: number) => Promise<void> = () => Promise.resolve(),
 ): Promise<BrowserHandle> {
-  const existing = await connectFreeSession(puppeteer, endpoint);
+  const existing = await takeReusableSession(puppeteer, endpoint, false);
   if (existing) {
     logStage("browser_acquired", { reused: true });
     return existing;
@@ -121,6 +178,15 @@ export async function acquireBrowser(
   let lastError: unknown;
   let lastLimits: BrowserLimits | null = null;
   for (let attempt = 0; attempt < BROWSER_LAUNCH_ATTEMPTS; attempt++) {
+    lastLimits = await readLimits(puppeteer, endpoint);
+    if (lastLimits?.allowedBrowserAcquisitions === 0) {
+      const stuck = await takeReusableSession(puppeteer, endpoint, true);
+      if (stuck) {
+        logStage("browser_acquired", { reused: true, attempt });
+        return stuck;
+      }
+      if (attempt > 0) throw browserRateLimitError(lastError ?? new Error("Rate limit exceeded"), lastLimits);
+    }
     try {
       const handle = await puppeteer.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
       logStage("browser_acquired", { reused: false, attempt });
@@ -128,14 +194,14 @@ export async function acquireBrowser(
     } catch (error) {
       lastError = error;
       if (!isBrowserRateLimit(error)) throw error;
-      lastLimits = await readLimits(puppeteer, endpoint);
-      const freed = await connectFreeSession(puppeteer, endpoint);
+      const freed = await takeReusableSession(puppeteer, endpoint, true);
       if (freed) {
         logStage("browser_acquired", { reused: true, attempt });
         return freed;
       }
+      lastLimits = (await readLimits(puppeteer, endpoint)) ?? lastLimits;
       const allowed = lastLimits?.allowedBrowserAcquisitions ?? 0;
-      if (allowed <= 0 || attempt === BROWSER_LAUNCH_ATTEMPTS - 1) {
+      if (isDailyBrowserAllowance(error, lastLimits) || allowed <= 0 || attempt === BROWSER_LAUNCH_ATTEMPTS - 1) {
         throw browserRateLimitError(error, lastLimits);
       }
     }
@@ -256,10 +322,82 @@ function remaining(deadline: number): number {
   return Math.max(1_000, deadline - Date.now());
 }
 
+interface PageEvent {
+  kind: "console" | "requestfailed" | "response";
+  text: string;
+}
+
+function scrubUrl(value: string): string {
+  return value.replace(/([?&](?:key|uploads|token)=)[^&\s'"]+/gi, "$1redacted");
+}
+
+function callText(value: unknown, method: string): string {
+  if (!value || typeof value !== "object") return "";
+  const fn = (value as Record<string, unknown>)[method];
+  if (typeof fn !== "function") return "";
+  try {
+    const result = fn.call(value);
+    return result == null ? "" : String(result);
+  } catch {
+    return "";
+  }
+}
+
+function relevantRequest(url: string): boolean {
+  return /\/api\/projects|\/assets\/|\/renders\/|\/models\//.test(url);
+}
+
+/**
+ * The page's fetch() only sees "Failed to fetch" for a CORS rejection. The
+ * CORS reason, the failed URL, and the preflight status are on these events.
+ */
+function attachPageDiagnostics(page: BrowserPage): PageEvent[] {
+  const events: PageEvent[] = [];
+  if (typeof page.on !== "function") return events;
+  const push = (kind: PageEvent["kind"], text: string) => {
+    const clean = scrubUrl(text).replace(/\s+/g, " ").trim().slice(0, 400);
+    if (!clean) return;
+    if (events.some((event) => event.kind === kind && event.text === clean)) return;
+    events.push({ kind, text: clean });
+    if (events.length > 12) events.shift();
+  };
+  page.on("console", (message) => {
+    const type = callText(message, "type");
+    const text = callText(message, "text") || (typeof message === "string" ? message : "");
+    if (type && type !== "error" && type !== "warning" && !/CORS|blocked|failed|net::/i.test(text)) return;
+    push("console", text);
+  });
+  page.on("requestfailed", (request) => {
+    const url = callText(request, "url");
+    const method = callText(request, "method") || "GET";
+    const failure = request && typeof request === "object" ? (request as { failure?: () => { errorText?: string } | null }).failure?.() : null;
+    const reason = failure?.errorText || "failed";
+    if (!relevantRequest(url) && !/CORS|ERR_|blocked/i.test(reason)) return;
+    push("requestfailed", `${method} ${url} ${reason}`);
+  });
+  page.on("response", (response) => {
+    const url = callText(response, "url");
+    const status = callText(response, "status");
+    const request = response && typeof response === "object" ? (response as { request?: () => unknown }).request?.() : null;
+    const method = callText(request, "method");
+    if (method !== "OPTIONS" && !relevantRequest(url) && Number(status) < 400) return;
+    push("response", `${status} ${method} ${url}`.trim());
+  });
+  return events;
+}
+
+function withDiagnostics(error: unknown, events: PageEvent[]): Error {
+  const base = error instanceof Error ? error : new Error(String(error));
+  if (!events.length || base.message.includes("Page network:")) return base;
+  const lines = events.slice(-8).map((event) => `${event.kind}: ${event.text}`);
+  return new Error(`${base.message} Page network: ${lines.join(" | ")}`);
+}
+
 /**
  * Open the hosted page and wait until it has uploaded each PNG. The return
  * value is the small done JSON. Screenshot bytes never enter this isolate.
- * A failed render closes the browser so the next call does not reuse it.
+ * A page error disconnects the browser so the next call reuses it. A browser
+ * that stops answering is closed.
  */
 export async function renderScreenshots(
   env: BrowserEnv,
@@ -279,8 +417,10 @@ export async function renderScreenshots(
   const deadline = Date.now() + RENDER_WALL_MS;
   let page: BrowserPage | undefined;
   let discard = false;
+  let events: PageEvent[] = [];
   try {
     page = await browser.newPage();
+    events = attachPageDiagnostics(page);
     await page.setViewport({ width: 900, height: 900, deviceScaleFactor: 1 });
     if (page.setCacheEnabled) await page.setCacheEnabled(false);
     const opened = new URL(pageUrl);
@@ -324,15 +464,20 @@ export async function renderScreenshots(
     const shots = parsed.shots || [];
     return indices.map((index) => frameFromPage(shots.find((shot) => shot.index === index), index, uploads.get(index)!));
   } catch (error) {
-    discard = true;
-    logStage("render_error", { message: error instanceof Error ? error.message : String(error), indexes: indices });
-    throw error;
+    const detailed = withDiagnostics(error, events);
+    discard = isPoisonedBrowser(detailed);
+    logStage("render_error", {
+      message: detailed.message,
+      indexes: indices,
+      discard,
+    });
+    throw detailed;
   } finally {
     if (page?.close) {
       try {
         await page.close();
       } catch {
-        /* A discarded session is closed below. A healthy one stays reusable. */
+        discard = true;
       }
     }
     await releaseBrowser(browser, discard);

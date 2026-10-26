@@ -140,14 +140,20 @@
         showLiveStatus('Loading live project…');
         var res;
         if (isRenderMode() && database) await clearProjectStores(database);
+        var projectUrl = apiBase + '/api/projects/' + encodeURIComponent(projectId);
         try {
-            res = await fetch(apiBase + '/api/projects/' + encodeURIComponent(projectId) + '?cb=' + Date.now(), {
+            // cache: 'no-store' is the fetch cache mode. Do not also set the
+            // Cache-Control request header: it is not CORS-safelisted, so the
+            // preflight asks to allow it and the browser drops the GET when
+            // the response does not list it.
+            res = await fetch(projectUrl + '?cb=' + Date.now(), {
                 cache: 'no-store',
-                headers: { 'X-Edit-Key': editKey, 'Accept': 'application/json', 'Cache-Control': 'no-store' }
+                headers: { 'X-Edit-Key': editKey, 'Accept': 'application/json' }
             });
         } catch (e) {
             pullFailed = true;
-            var offline = 'Could not reach the screenshot API';
+            var detail = (e && e.message) ? e.message : 'network error';
+            var offline = 'Could not reach the screenshot API: GET ' + projectUrl + ' (' + detail + ')';
             showLiveStatus(offline);
             if (isRenderMode()) markError(offline);
             return;
