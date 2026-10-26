@@ -10,6 +10,7 @@ import {
   BROWSER_LAUNCH_ATTEMPTS,
   browserRateLimitError,
   isBrowserRateLimit,
+  isDailyBrowserAllowance,
   renderScreenshots,
   type BrowserHandle,
   type PuppeteerBinding,
@@ -19,13 +20,17 @@ import { createMemoryKv } from "./memory-kv.ts";
 
 const RATE_LIMIT = "Unable to create new browser: code: 429: message: Rate limit exceeded";
 
-function browser(id = "b"): BrowserHandle & { closed: boolean; disconnected: boolean } {
+function browser(id = "b", options?: { healthy?: boolean }): BrowserHandle & { id: string; closed: boolean; disconnected: boolean } {
   const handle = {
     id,
     closed: false,
     disconnected: false,
     async newPage() {
       throw new Error("newPage is not used in acquireBrowser tests");
+    },
+    async version() {
+      if (options?.healthy === false) throw new Error("Protocol error: target closed");
+      return "Chrome";
     },
     async disconnect() {
       handle.disconnected = true;
@@ -50,6 +55,14 @@ describe("browser sessions", () => {
       browserRateLimitError(new Error(RATE_LIMIT), { timeUntilNextAllowedBrowserAcquisition: 45_000 }).message,
       /Wait about 45 seconds/,
     );
+    const daily = "Unable to create new browser: code: 429: message: Browser time limit exceeded for today";
+    assert.equal(isDailyBrowserAllowance(new Error(daily)), true);
+    assert.equal(isDailyBrowserAllowance(new Error(RATE_LIMIT), { timeUntilNextAllowedBrowserAcquisition: 45_000 }), false);
+    const dailyMessage = browserRateLimitError(new Error(daily)).message;
+    assert.match(dailyMessage, /daily allowance is exhausted/);
+    assert.match(dailyMessage, /10 minutes of browser time per UTC day/);
+    assert.match(dailyMessage, /00:00 UTC/);
+    assert.doesNotMatch(dailyMessage, /per-minute limit on creating a new browser/);
   });
 
   it("reuses a free session and keeps a new browser alive", async () => {
@@ -188,6 +201,60 @@ describe("browser sessions", () => {
     assert.equal(launches, 2);
     assert.deepEqual(sleeps, []);
   });
+
+  it("closes a session that does not answer and launches another", async () => {
+    const closed: string[] = [];
+    let launches = 0;
+    const puppeteer: PuppeteerBinding = {
+      async sessions() {
+        return [{ sessionId: "bad" }];
+      },
+      async connect() {
+        return {
+          async newPage() {
+            throw new Error("unused");
+          },
+          async version() {
+            throw new Error("Protocol error: target closed");
+          },
+          async close() {
+            closed.push("bad");
+          },
+        };
+      },
+      async launch() {
+        launches += 1;
+        return browser("fresh");
+      },
+    };
+    const handle = await acquireBrowser(puppeteer, {});
+    assert.equal(launches, 1);
+    assert.deepEqual(closed, ["bad"]);
+    assert.equal((handle as { id: string }).id, "fresh");
+  });
+
+  it("reuses a still-connected session when a new browser is not allowed", async () => {
+    let launches = 0;
+    const puppeteer: PuppeteerBinding = {
+      async sessions() {
+        return [{ sessionId: "stuck", connectionId: "old-worker" }];
+      },
+      async connect(_endpoint, sessionId) {
+        assert.equal(sessionId, "stuck");
+        return browser("stuck");
+      },
+      async launch() {
+        launches += 1;
+        throw new Error(RATE_LIMIT);
+      },
+      async limits() {
+        return { allowedBrowserAcquisitions: 0, timeUntilNextAllowedBrowserAcquisition: 45_000 };
+      },
+    };
+    const handle = await acquireBrowser(puppeteer, {});
+    assert.equal(launches, 0);
+    assert.equal((handle as { id: string }).id, "stuck");
+  });
 });
 
 describe("renderScreenshots", () => {
@@ -264,16 +331,44 @@ describe("renderScreenshots", () => {
     assert.equal(closes, 1);
   });
 
-  it("closes a session that rendered an error so the next call cannot reuse it", async () => {
+  it("keeps a healthy session after a page error and reports the fetch failure", async () => {
     let disconnects = 0;
     let closes = 0;
+    const listeners: Record<string, ((payload: unknown) => void)[]> = {};
     const page = {
       async setViewport() {},
       async setCacheEnabled() {},
-      async goto() {},
+      on(event: string, handler: (payload: unknown) => void) {
+        (listeners[event] ||= []).push(handler);
+      },
+      async goto() {
+        for (const handler of listeners.console || []) {
+          handler({
+            type: () => "error",
+            text: () => "Access to fetch at 'https://worker.test/api/projects/p?cb=1' has been blocked by CORS policy: Request header field cache-control is not allowed by Access-Control-Allow-Headers in preflight response.",
+          });
+        }
+        for (const handler of listeners.requestfailed || []) {
+          handler({
+            method: () => "GET",
+            url: () => "https://worker.test/api/projects/p?cb=1&key=secret-edit-key",
+            failure: () => ({ errorText: "net::ERR_FAILED" }),
+          });
+        }
+        for (const handler of listeners.response || []) {
+          handler({
+            status: () => 204,
+            url: () => "https://worker.test/api/projects/p?cb=1",
+            request: () => ({ method: () => "OPTIONS" }),
+          });
+        }
+      },
       async waitForFunction() {},
       async evaluate() {
-        return { status: "error", error: "Screenshot 0 (asset abc) failed to load" };
+        return {
+          status: "error",
+          error: "Could not reach the screenshot API: GET https://worker.test/api/projects/p (Failed to fetch)",
+        };
       },
       async close() {},
     };
@@ -301,7 +396,62 @@ describe("renderScreenshots", () => {
     const token = "ab".repeat(32);
     await assert.rejects(
       () => renderScreenshots({ BROWSER: {} }, `https://example.test/?render=0&uploads=0:${token}`, [0], { puppeteer }),
-      /asset abc/,
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /Could not reach the screenshot API/);
+        assert.match(message, /cache-control is not allowed/);
+        assert.match(message, /requestfailed: GET https:\/\/worker\.test\/api\/projects\/p/);
+        assert.match(message, /net::ERR_FAILED/);
+        assert.match(message, /response: 204 OPTIONS/);
+        assert.match(message, /key=redacted/);
+        assert.equal(message.includes("secret-edit-key"), false);
+        return true;
+      },
+    );
+    assert.equal(closes, 0);
+    assert.equal(disconnects, 1);
+  });
+
+  it("closes a browser that dies during navigation", async () => {
+    let disconnects = 0;
+    let closes = 0;
+    const page = {
+      async setViewport() {},
+      async setCacheEnabled() {},
+      async goto() {
+        throw new Error("Protocol error (Target.goto): target closed");
+      },
+      async waitForFunction() {},
+      async evaluate() {
+        return { status: "done", error: "", result: "" };
+      },
+      async close() {},
+    };
+    const puppeteer: PuppeteerBinding = {
+      async sessions() {
+        return [];
+      },
+      async connect() {
+        throw new Error("none");
+      },
+      async launch() {
+        return {
+          async newPage() {
+            return page;
+          },
+          async disconnect() {
+            disconnects += 1;
+          },
+          async close() {
+            closes += 1;
+          },
+        };
+      },
+    };
+    const token = "ab".repeat(32);
+    await assert.rejects(
+      () => renderScreenshots({ BROWSER: {} }, `https://example.test/?render=0&uploads=0:${token}`, [0], { puppeteer }),
+      /target closed/,
     );
     assert.equal(closes, 1);
     assert.equal(disconnects, 0);

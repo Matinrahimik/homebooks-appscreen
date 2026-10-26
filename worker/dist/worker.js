@@ -22638,16 +22638,46 @@ function acquisitionWaitMs(value) {
   if (value < 1e3) return Math.round(value * 1e3);
   return Math.round(value);
 }
+function isDailyBrowserAllowance(cause, limits2) {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  if (/browser time limit exceeded|exceeded for today|daily browser|per day|duration quota/i.test(raw)) return true;
+  const wait = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
+  return wait != null && wait >= 30 * 60 * 1e3;
+}
 function browserRateLimitError(cause, limits2) {
   const raw = cause instanceof Error ? cause.message : String(cause);
+  if (isDailyBrowserAllowance(cause, limits2)) {
+    return new Error(
+      `Browser Rendering daily allowance is exhausted. The Workers Free plan includes about 10 minutes of browser time per UTC day. ${raw}. Retry after the daily reset at 00:00 UTC. This is not the per-minute new-browser limit, and launching again will not help until the allowance resets.`
+    );
+  }
   const waitMs = acquisitionWaitMs(limits2?.timeUntilNextAllowedBrowserAcquisition);
   const seconds = waitMs != null ? Math.max(1, Math.ceil(waitMs / 1e3)) : 60;
-  const daily = /daily|browser hours|duration quota/i.test(raw) ? " If the message is the free-plan daily browser-time cap, retry after that allowance resets." : "";
   return new Error(
-    `Browser Rendering rate limit: ${raw}. retry-after: ${seconds} seconds. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A healthy disconnected session is reused. A failed render closes its session.${daily}`
+    `Browser Rendering rate limit: ${raw}. retry-after: ${seconds} seconds. This is the per-minute limit on creating a new browser. Wait about ${seconds} seconds and call render_preview or export_project again. A healthy session is reused, including after a page error. A browser that stops answering is closed.`
   );
 }
-async function connectFreeSession(puppeteer2, endpoint) {
+function isPoisonedBrowser(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /protocol error|target closed|session closed|browser has disconnected|browser closed|websocket|connection closed|ECONNRESET|crashed|most likely the page has been closed|not ready yet/i.test(message);
+}
+async function browserHealthy(browser) {
+  if (typeof browser.version !== "function") return true;
+  try {
+    await browser.version();
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function closeQuietly(browser) {
+  if (typeof browser.close !== "function") return;
+  try {
+    await browser.close();
+  } catch {
+  }
+}
+async function takeReusableSession(puppeteer2, endpoint, includeConnected) {
   let sessions2 = [];
   try {
     sessions2 = await puppeteer2.sessions(endpoint);
@@ -22655,11 +22685,17 @@ async function connectFreeSession(puppeteer2, endpoint) {
     return null;
   }
   for (const session of sessions2) {
-    if (!session?.sessionId || session.connectionId) continue;
+    if (!session?.sessionId) continue;
+    if (session.connectionId && !includeConnected) continue;
+    let handle;
     try {
-      return await puppeteer2.connect(endpoint, session.sessionId);
+      handle = await puppeteer2.connect(endpoint, session.sessionId);
     } catch {
+      continue;
     }
+    if (await browserHealthy(handle)) return handle;
+    logStage("browser_closed", { reason: "unhealthy" });
+    await closeQuietly(handle);
   }
   return null;
 }
@@ -22672,7 +22708,7 @@ async function readLimits(puppeteer2, endpoint) {
   }
 }
 async function acquireBrowser(puppeteer2, endpoint, _wait = () => Promise.resolve()) {
-  const existing = await connectFreeSession(puppeteer2, endpoint);
+  const existing = await takeReusableSession(puppeteer2, endpoint, false);
   if (existing) {
     logStage("browser_acquired", { reused: true });
     return existing;
@@ -22680,6 +22716,15 @@ async function acquireBrowser(puppeteer2, endpoint, _wait = () => Promise.resolv
   let lastError;
   let lastLimits = null;
   for (let attempt = 0; attempt < BROWSER_LAUNCH_ATTEMPTS; attempt++) {
+    lastLimits = await readLimits(puppeteer2, endpoint);
+    if (lastLimits?.allowedBrowserAcquisitions === 0) {
+      const stuck = await takeReusableSession(puppeteer2, endpoint, true);
+      if (stuck) {
+        logStage("browser_acquired", { reused: true, attempt });
+        return stuck;
+      }
+      if (attempt > 0) throw browserRateLimitError(lastError ?? new Error("Rate limit exceeded"), lastLimits);
+    }
     try {
       const handle = await puppeteer2.launch(endpoint, { keep_alive: BROWSER_KEEP_ALIVE_MS });
       logStage("browser_acquired", { reused: false, attempt });
@@ -22687,14 +22732,14 @@ async function acquireBrowser(puppeteer2, endpoint, _wait = () => Promise.resolv
     } catch (error) {
       lastError = error;
       if (!isBrowserRateLimit(error)) throw error;
-      lastLimits = await readLimits(puppeteer2, endpoint);
-      const freed = await connectFreeSession(puppeteer2, endpoint);
+      const freed = await takeReusableSession(puppeteer2, endpoint, true);
       if (freed) {
         logStage("browser_acquired", { reused: true, attempt });
         return freed;
       }
+      lastLimits = await readLimits(puppeteer2, endpoint) ?? lastLimits;
       const allowed = lastLimits?.allowedBrowserAcquisitions ?? 0;
-      if (allowed <= 0 || attempt === BROWSER_LAUNCH_ATTEMPTS - 1) {
+      if (isDailyBrowserAllowance(error, lastLimits) || allowed <= 0 || attempt === BROWSER_LAUNCH_ATTEMPTS - 1) {
         throw browserRateLimitError(error, lastLimits);
       }
     }
@@ -22780,6 +22825,63 @@ function frameFromPage(shot, index, token) {
 function remaining(deadline) {
   return Math.max(1e3, deadline - Date.now());
 }
+function scrubUrl(value) {
+  return value.replace(/([?&](?:key|uploads|token)=)[^&\s'"]+/gi, "$1redacted");
+}
+function callText(value, method) {
+  if (!value || typeof value !== "object") return "";
+  const fn = value[method];
+  if (typeof fn !== "function") return "";
+  try {
+    const result = fn.call(value);
+    return result == null ? "" : String(result);
+  } catch {
+    return "";
+  }
+}
+function relevantRequest(url) {
+  return /\/api\/projects|\/assets\/|\/renders\/|\/models\//.test(url);
+}
+function attachPageDiagnostics(page) {
+  const events = [];
+  if (typeof page.on !== "function") return events;
+  const push = (kind, text) => {
+    const clean = scrubUrl(text).replace(/\s+/g, " ").trim().slice(0, 400);
+    if (!clean) return;
+    if (events.some((event) => event.kind === kind && event.text === clean)) return;
+    events.push({ kind, text: clean });
+    if (events.length > 12) events.shift();
+  };
+  page.on("console", (message) => {
+    const type = callText(message, "type");
+    const text = callText(message, "text") || (typeof message === "string" ? message : "");
+    if (type && type !== "error" && type !== "warning" && !/CORS|blocked|failed|net::/i.test(text)) return;
+    push("console", text);
+  });
+  page.on("requestfailed", (request) => {
+    const url = callText(request, "url");
+    const method = callText(request, "method") || "GET";
+    const failure = request && typeof request === "object" ? request.failure?.() : null;
+    const reason = failure?.errorText || "failed";
+    if (!relevantRequest(url) && !/CORS|ERR_|blocked/i.test(reason)) return;
+    push("requestfailed", `${method} ${url} ${reason}`);
+  });
+  page.on("response", (response) => {
+    const url = callText(response, "url");
+    const status = callText(response, "status");
+    const request = response && typeof response === "object" ? response.request?.() : null;
+    const method = callText(request, "method");
+    if (method !== "OPTIONS" && !relevantRequest(url) && Number(status) < 400) return;
+    push("response", `${status} ${method} ${url}`.trim());
+  });
+  return events;
+}
+function withDiagnostics(error, events) {
+  const base = error instanceof Error ? error : new Error(String(error));
+  if (!events.length || base.message.includes("Page network:")) return base;
+  const lines = events.slice(-8).map((event) => `${event.kind}: ${event.text}`);
+  return new Error(`${base.message} Page network: ${lines.join(" | ")}`);
+}
 async function renderScreenshots(env, pageUrl, indices, hooks) {
   if (!env.BROWSER && !hooks?.puppeteer) {
     throw new Error("Browser Rendering binding BROWSER is not configured.");
@@ -22793,8 +22895,10 @@ async function renderScreenshots(env, pageUrl, indices, hooks) {
   const deadline = Date.now() + RENDER_WALL_MS;
   let page;
   let discard = false;
+  let events = [];
   try {
     page = await browser.newPage();
+    events = attachPageDiagnostics(page);
     await page.setViewport({ width: 900, height: 900, deviceScaleFactor: 1 });
     if (page.setCacheEnabled) await page.setCacheEnabled(false);
     const opened = new URL(pageUrl);
@@ -22838,14 +22942,20 @@ async function renderScreenshots(env, pageUrl, indices, hooks) {
     const shots = parsed.shots || [];
     return indices.map((index) => frameFromPage(shots.find((shot) => shot.index === index), index, uploads.get(index)));
   } catch (error) {
-    discard = true;
-    logStage("render_error", { message: error instanceof Error ? error.message : String(error), indexes: indices });
-    throw error;
+    const detailed = withDiagnostics(error, events);
+    discard = isPoisonedBrowser(detailed);
+    logStage("render_error", {
+      message: detailed.message,
+      indexes: indices,
+      discard
+    });
+    throw detailed;
   } finally {
     if (page?.close) {
       try {
         await page.close();
       } catch {
+        discard = true;
       }
     }
     await releaseBrowser(browser, discard);
@@ -23604,6 +23714,32 @@ data: ${json2}
 
 // src/http.ts
 var PAGES_ORIGIN = "https://matinrahimik.github.io";
+var BASE_CORS_HEADERS = [
+  "Authorization",
+  "Content-Type",
+  "X-Edit-Key",
+  "Accept",
+  "Cache-Control",
+  "X-Appscreen-Crc",
+  "X-Appscreen-Width",
+  "X-Appscreen-Height",
+  "X-Appscreen-Sha256",
+  "X-Appscreen-Index"
+];
+function accessControlAllowHeaders(request) {
+  const seen = /* @__PURE__ */ new Set();
+  const names = [];
+  const add = (name) => {
+    const trimmed = name.trim();
+    const key = trimmed.toLowerCase();
+    if (!/^[a-z0-9-]+$/.test(key) || seen.has(key)) return;
+    seen.add(key);
+    names.push(trimmed);
+  };
+  for (const name of BASE_CORS_HEADERS) add(name);
+  for (const part of (request.headers.get("Access-Control-Request-Headers") || "").split(",")) add(part);
+  return names.join(", ");
+}
 function corsHeaders(request, env) {
   const headers = new Headers();
   const origin = request.headers.get("Origin");
@@ -23614,11 +23750,8 @@ function corsHeaders(request, env) {
   headers.set("Access-Control-Allow-Origin", origin);
   headers.set("Vary", "Origin");
   headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  headers.set(
-    "Access-Control-Allow-Headers",
-    "Authorization, Content-Type, X-Edit-Key, Accept, X-Appscreen-Crc, X-Appscreen-Width, X-Appscreen-Height, X-Appscreen-Sha256, X-Appscreen-Index"
-  );
-  headers.set("Access-Control-Max-Age", "86400");
+  headers.set("Access-Control-Allow-Headers", accessControlAllowHeaders(request));
+  headers.set("Access-Control-Max-Age", "600");
   return headers;
 }
 function withCors(request, env, response) {

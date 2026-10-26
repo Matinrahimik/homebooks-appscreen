@@ -10,6 +10,35 @@ import { storeZipStream } from "./zip.ts";
 
 const PAGES_ORIGIN = "https://matinrahimik.github.io";
 
+const BASE_CORS_HEADERS = [
+  "Authorization",
+  "Content-Type",
+  "X-Edit-Key",
+  "Accept",
+  "Cache-Control",
+  "X-Appscreen-Crc",
+  "X-Appscreen-Width",
+  "X-Appscreen-Height",
+  "X-Appscreen-Sha256",
+  "X-Appscreen-Index",
+];
+
+/** Union of the headers this API uses and the headers this preflight asked to send. */
+export function accessControlAllowHeaders(request: Request): string {
+  const seen = new Set<string>();
+  const names: string[] = [];
+  const add = (name: string) => {
+    const trimmed = name.trim();
+    const key = trimmed.toLowerCase();
+    if (!/^[a-z0-9-]+$/.test(key) || seen.has(key)) return;
+    seen.add(key);
+    names.push(trimmed);
+  };
+  for (const name of BASE_CORS_HEADERS) add(name);
+  for (const part of (request.headers.get("Access-Control-Request-Headers") || "").split(",")) add(part);
+  return names.join(", ");
+}
+
 export function corsHeaders(request: Request, env: Env): Headers {
   const headers = new Headers();
   const origin = request.headers.get("Origin");
@@ -22,11 +51,8 @@ export function corsHeaders(request: Request, env: Env): Headers {
   headers.set("Access-Control-Allow-Origin", origin);
   headers.set("Vary", "Origin");
   headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  headers.set(
-    "Access-Control-Allow-Headers",
-    "Authorization, Content-Type, X-Edit-Key, Accept, X-Appscreen-Crc, X-Appscreen-Width, X-Appscreen-Height, X-Appscreen-Sha256, X-Appscreen-Index",
-  );
-  headers.set("Access-Control-Max-Age", "86400");
+  headers.set("Access-Control-Allow-Headers", accessControlAllowHeaders(request));
+  headers.set("Access-Control-Max-Age", "600");
   return headers;
 }
 
