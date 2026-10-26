@@ -14,6 +14,9 @@ node_modules/
 /dist/
 /out/
 
+# Local screenshot server (projects, assets, renders). Edit keys live here.
+/data/
+
 # Tauri
 src-tauri/target/
 frontend-dist/

@@ -68,9 +68,14 @@
         el.textContent = text;
     }
 
+    function setStage(stage) {
+        document.documentElement.dataset.appscreenStage = stage;
+    }
+
     function markError(message) {
         window.__appscreenFinished = true;
         window.__appscreenError = message;
+        setStage('error');
         document.documentElement.dataset.appscreenStatus = 'error';
         document.documentElement.dataset.appscreenError = message;
     }
@@ -78,6 +83,7 @@
     function markReady() {
         window.__appscreenFinished = true;
         window.__appscreenReady = true;
+        setStage('ready');
         document.documentElement.dataset.appscreenStatus = 'ready';
         if (typeof canvas !== 'undefined' && canvas) {
             document.documentElement.dataset.appscreenWidth = String(canvas.width);
@@ -88,6 +94,7 @@
     function markDone(shots) {
         window.__appscreenFinished = true;
         window.__appscreenResult = { shots: shots };
+        setStage('done');
         document.documentElement.dataset.appscreenStatus = 'done';
         document.documentElement.dataset.appscreenResult = JSON.stringify({ shots: shots });
         if (typeof canvas !== 'undefined' && canvas) {
@@ -137,6 +144,7 @@
 
     async function pull(database) {
         if (!live) return;
+        setStage('loading');
         showLiveStatus('Loading live project…');
         var res;
         if (isRenderMode() && database) await clearProjectStores(database);
@@ -319,8 +327,27 @@
         return window.AppscreenReady;
     }
 
+    // Long enough for a slow script, and short enough that the page can report
+    // failure inside the Worker's 50s render cap. render-ready.js is a blocking
+    // script before this file, so a missing helper means it 404'd or threw.
+    var HELPER_WAIT_MS = 20000;
+
+    async function waitForHelpers() {
+        setStage('helpers');
+        var deadline = Date.now() + HELPER_WAIT_MS;
+        while (!readyApi() && Date.now() < deadline) await sleep(50);
+        if (readyApi()) return;
+        throw new Error(
+            'Render helpers did not load: render-ready.js did not set AppscreenReady within ' +
+            HELPER_WAIT_MS + 'ms (stage helpers). The Pages site was not serving that file, or the script threw before installing.'
+        );
+    }
+
     async function waitForScreenshots() {
-        var deadline = Date.now() + 60000;
+        setStage('loading');
+        // Local renders decode several multi-megabyte screenshots plus the panorama
+        // before the first upload. The Worker still stops at its own wall clock.
+        var deadline = Date.now() + 120000;
         while (Date.now() < deadline) {
             if (pullFailed) throw new Error(window.__appscreenError || 'Project failed to load');
             var api = readyApi();
@@ -466,7 +493,7 @@
         if (typeof showThreeJS === 'function') showThreeJS(true);
         if (typeof switchPhoneModel === 'function') switchPhoneModel(ss.device3D || 'iphone');
         var started = Date.now();
-        while (typeof phoneModelLoaded !== 'undefined' && !phoneModelLoaded && Date.now() - started < 40000) {
+        while (typeof phoneModelLoaded !== 'undefined' && !phoneModelLoaded && Date.now() - started < 60000) {
             await sleep(100);
         }
         if (typeof phoneModelLoaded !== 'undefined' && !phoneModelLoaded) {
@@ -486,6 +513,7 @@
     }
 
     async function paintIndex(index) {
+        setStage('painting');
         if (!state.screenshots[index]) throw new Error('Screenshot index ' + index + ' is not loaded');
         state.selectedIndex = index;
         if (typeof syncUIWithState === 'function') syncUIWithState();
@@ -566,6 +594,7 @@
     }
 
     async function uploadIndex(index) {
+        setStage('uploading');
         var api = readyApi();
         var token = uploadSlots()[index];
         if (!token) throw new Error('Screenshot ' + index + ' has no upload token');
@@ -627,7 +656,7 @@
     }
 
     async function renderAndUpload() {
-        if (params.get('uploads') && !readyApi()) throw new Error('Render helpers did not load');
+        if (params.get('uploads')) await waitForHelpers();
         var uploading = Object.keys(uploadSlots()).length > 0;
         if (params.get('uploads') && !uploading) throw new Error('Upload tokens were not understood');
         await waitForScreenshots();
@@ -655,6 +684,7 @@
     }
 
     if (isRenderMode()) {
+        setStage('boot');
         window.__appscreenReady = false;
         window.__appscreenError = null;
         window.__appscreen = {

@@ -1,3 +1,5 @@
+# Static GitHub Pages only. This workflow does not deploy, publish, or configure
+# the Cloudflare Worker.
 name: Deploy GitHub Pages
 
 on:
@@ -29,7 +31,8 @@ jobs:
         run: |
           mkdir -p _site
           cp index.html styles.css app.js three-renderer.js language-utils.js \
-             llm.js magical-titles.js lucide-icons.js live-sync.js backup-state.js .nojekyll _site/
+             llm.js magical-titles.js lucide-icons.js live-sync.js render-ready.js \
+             backup-state.js .nojekyll _site/
           cp -R img models _site/
           # Project Pages serves this repo at /homebooks-appscreen/. Relative
           # asset URLs plus the base-path script in index.html resolve models
