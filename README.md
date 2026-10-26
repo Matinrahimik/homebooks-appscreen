@@ -7,6 +7,42 @@ A free, open-source tool for creating beautiful App Store screenshots with custo
 
 This fork also publishes the designer for HomeBooks at [matinrahimik.github.io/homebooks-appscreen](https://matinrahimik.github.io/homebooks-appscreen/). Agents can build the same projects through the MCP server documented in [worker/README.md](worker/README.md). Open a live project with `?project=<id>&key=<editKey>` to edit it by hand; the page loads and saves the existing project-backup JSON.
 
+## Local screenshot server (Linux)
+
+The local server runs the editor, the same project API, and the MCP tools on this machine. It stores projects under `./data` and renders with headless Chromium. It does not call Cloudflare. There is no Wrangler deploy, no KV write, and no npm script or workflow that publishes the Worker. The Worker in `worker/` stays in place for the hosted service.
+
+Target: a shared Ubuntu-like x86_64 box, including a non-root user. Node.js 22 or newer.
+
+```bash
+node -v          # v22 or newer
+npm install      # installs Playwright and downloads Chromium
+npm start        # http://127.0.0.1:8787  and  http://127.0.0.1:8787/mcp
+```
+
+`npm install` runs `playwright install chromium`, which puts the browser in your user cache and does not need root. If Chromium then fails to launch because shared libraries are missing, an admin installs them once:
+
+```bash
+npx playwright install-deps chromium
+# or, without root, ask an admin for the Playwright Ubuntu packages:
+# libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3
+# libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1
+# libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 libxshmfence1
+```
+
+The server always launches Chromium with `--no-sandbox`, so a non-root user can render once those libraries are present.
+
+Override the bind address with `PORT`, `HOST`, and `APPSCREEN_DATA`, or `npm start -- --port 8787 --host 127.0.0.1 --data ./data`. If `APPSCREEN_MCP_TOKEN` is unset, MCP is open only when the process is bound to loopback; any other host refuses to start. When the token is set, `/mcp` requires `Authorization: Bearer <token>`. Project reads and writes still accept that bearer or the project's `X-Edit-Key`.
+
+Import a remote project with a read-only GET (bearer or edit key). Asset bytes are checked against their sha256 before they are stored:
+
+```bash
+APPSCREEN_MCP_TOKEN=... npm run import -- --project 499a5563-b553-477b-aaeb-35221b7be91a
+npm run import -- --project 499a5563-b553-477b-aaeb-35221b7be91a --key <editKey>
+npm run import -- --file backup.json --assets ./assets-dir
+```
+
+The same import is the MCP tool `import_remote_project`. Import stores each asset as the downloaded bytes and does not apply the Worker KV size cap. A new panorama uploaded later through `set_panoramic_background` still has to be 8 MiB or smaller, matching that tool. Renders are written to `./data/renders/<projectId>/screenshot-N.png` and `screenshots.zip`. Tool results include that filesystem path and an `http://127.0.0.1:<port>/renders/output/...` URL.
+
 ![App Store Screenshot Generator](img/screenshot-generator.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

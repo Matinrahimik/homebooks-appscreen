@@ -13,11 +13,22 @@
     "type": "git",
     "url": "https://github.com/YUZU-Hub/appscreen"
   },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "serve": "python3 -m http.server 8000",
+    "start": "node --experimental-strip-types local/server.ts",
+    "import": "node --experimental-strip-types local/import-cli.ts",
+    "postinstall": "playwright install chromium",
+    "test:local": "node --experimental-strip-types --test test/pages-artifact.test.mjs test/local-server.test.ts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "playwright": "^1.56.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
